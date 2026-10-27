@@ -38,7 +38,7 @@ body:
     attributes:
       label: 版本
       description: Release 版本号，或者自己编的话写 commit hash
-      placeholder: v0.2.3
+      placeholder: v0.2.4
     validations:
       required: false
 

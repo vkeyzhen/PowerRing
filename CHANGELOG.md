@@ -3,7 +3,7 @@
 本项目的所有值得记录的改动都写在这里。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.4] — 2026-10-27
 
 主题：**把「读到的到底是谁的、可信到什么程度」说清楚**。
 
@@ -30,6 +30,13 @@
 
 - 百分比式设备必须**真的给出一个百分比**才算认出来。应答了却没给数，
   认下来只会得到一台永远显示「--」的设备
+
+### 已知问题（还没定方案）
+
+- 天箭（raw 协议）在充电档位下，数值字节可能本来就是无效的，但我们仍按
+  「读到多少报多少」处理；充电中读不到数时电量环画蓝色还是灰色，
+  是产品取舍不是 bug，见 [#10](https://github.com/vkeyzhen/PowerRing/issues/10)。
+  要等真有这台设备的人看一眼才能定 —— 猜一个方案比不修更糟
 
 ## [0.2.3] — 2026-10-27
 
@@ -341,3 +348,4 @@ release 产物约 930 KB（验收线 5 MB）。release profile 用的是 `opt-le
 [0.2.1]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.1
 [0.2.2]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.2
 [0.2.3]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.3
+[0.2.4]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.4
