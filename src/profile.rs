@@ -481,15 +481,25 @@ pub fn save_synced(list: &[Profile]) -> (usize, usize) {
         keep.insert(file.clone());
         let path = dir.join(&file);
         let text = to_yaml(p, NOTE_SYNCED);
+        // 先读旧内容判断这是「新增」还是「更新」，但**计数要等写成功之后**。
+        // 以前在写之前就加，写失败只打一行 warn，界面照样报「新增了 3 份」——
+        // 用户看到的是成功，磁盘上是空的，重启还是老样子。
         // 内容没变就不写：省一次磁盘写入，也让文件时间戳老实待着 ——
         // 用户可能正盯着这个目录排查问题，每次同步都跳一遍时间戳会误导他
-        match fs::read_to_string(&path) {
+        let is_new = match fs::read_to_string(&path) {
             Ok(old) if old == text => continue,
-            Ok(_) => updated += 1,
-            Err(_) => added += 1,
-        }
+            Ok(_) => false,
+            Err(_) => true,
+        };
         match fs::write(&path, text) {
-            Ok(()) => info!("[profile] 同步声明 {file}"),
+            Ok(()) => {
+                if is_new {
+                    added += 1;
+                } else {
+                    updated += 1;
+                }
+                info!("[profile] 同步声明 {file}");
+            }
             Err(e) => warn!("[profile] 写不进 {:?}：{e}", path),
         }
     }

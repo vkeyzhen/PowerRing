@@ -279,10 +279,6 @@ fn scan_hidpp(
         if conn.feature_index(dev_idx, feat).is_none() {
             continue;
         }
-        let uniq = format!("{path_key}#{dev_idx}");
-        if !seen.insert(uniq) {
-            continue;
-        }
 
         // 识别：读设备名并与声明里的关键字比对，避免同接收器上的其它设备被误认
         let reported = prof
@@ -297,6 +293,14 @@ fn scan_hidpp(
             if !hit {
                 continue;
             }
+        }
+
+        // 占坑必须放在识别**之后**。以前放在前面，名称对不上的声明也把这个
+        // path#slot 占了，后面那份真正匹配的声明就被当成「重复」跳过 ——
+        // 表现是「明明有两份声明覆盖它，却一台都认不出」，而且看起来特别像设备的问题
+        let uniq = format!("{path_key}#{dev_idx}");
+        if !seen.insert(uniq) {
+            continue;
         }
 
         let name = reported
