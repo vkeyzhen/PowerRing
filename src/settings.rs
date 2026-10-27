@@ -23,10 +23,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, GetClientRect, GetWindowRect,
-    GetWindowTextW, RegisterClassW, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, HMENU,
-    HWND_TOP, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_SETFONT, WM_SETTINGCHANGE,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, RegisterClassW, SendMessageW, SetWindowPos,
+    SetWindowTextW, ShowWindow, HMENU, HWND_TOP, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_SETFONT, WM_SETTINGCHANGE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 // 按钮和复选框都改成自绘（BS_OWNERDRAW）。
@@ -595,7 +596,10 @@ fn on_save() {
     // 主题是点了就生效的，保存时把此刻的模式记下来就行
     cfg.theme = theme::current_mode().as_str().to_string();
     cfg.remote_devices_url = url.clone();
-    cfg.save();
+    // 存不下是要说出来的。磁盘满、%APPDATA% 被策略锁成只读时，写盘会失败，
+    // 而运行中的值仍然按新的生效 —— 若照样显示「已保存」，用户要到下次重启
+    // 才发现白改了，还会怀疑是别的原因。所以把失败留到提示里说
+    let save_err = cfg.save().err();
     set_interval(interval);
     set_low(warn, critical);
     set_notify(notify);
@@ -627,6 +631,11 @@ fn on_save() {
                 tip = format!("开机自启{}失败：{}", if auto { "开启" } else { "关闭" }, e);
             }
         }
+    }
+    // 写盘失败的提示要盖过上面所有文案。运行中的值已经按新的生效了，
+    // 只有磁盘上还是旧的 —— 不说清楚，用户重启后才莫名其妙地回到旧设置
+    if let Some(e) = &save_err {
+        tip = format!("已生效，但没能写入配置文件（{e}）—— 重启后会恢复成原来的设置");
     }
     set_status(&tip);
     info!(
@@ -806,15 +815,21 @@ fn set_status(text: &str) {
 }
 
 fn text_of(hw: HWND) -> String {
-    // 512 不是为了省内存，是为了装得下一个 URL：设置里那格要放完整的地址，
-    // 按早先的 32 长度读会被截到 31 个字符 —— 存下去的是半个地址，
-    // 而输入框里看着是完整的，用户根本想不到问题出在这
-    let mut buf = [0u16; 512];
-    let n = unsafe { GetWindowTextW(hw, &mut buf) };
+    // 长度按控件里的实际内容取，不写死栈缓冲。
+    // 这里踩过两次：先是 32 长度把 URL 截到 31 个字符，改成 512 之后又只是把阈值
+    // 挪到了 511 —— 粘贴一个带签名的长地址，存下去仍是半截，而输入框里看着完整，
+    // 用户根本想不到问题出在读取这一步。GetWindowTextW 超长时是**静默截断**，
+    // 所以只能先问长度再分配。
+    let n = unsafe { GetWindowTextLengthW(hw) };
     if n <= 0 {
         return String::new();
     }
-    String::from_utf16_lossy(&buf[..n as usize])
+    let mut buf = vec![0u16; n as usize + 1];
+    let got = unsafe { GetWindowTextW(hw, &mut buf) };
+    if got <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..got as usize])
 }
 
 fn set_text(hw: HWND, text: &str) {

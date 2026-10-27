@@ -87,11 +87,16 @@ impl Hidpp {
         let n = req.len().min(size);
         out[..n].copy_from_slice(&req[..n]);
 
-        // 清空遗留应答，避免读到上一轮的回复
+        // 清空遗留应答，避免读到上一轮的回复。
+        // **必须有次数上限**：若匹配到的接口会持续上报（键盘、鼠标的输入接口就是这样，
+        // 一份写错的声明完全可能指到那种接口），「读到 0 才停」的循环会永远转下去，
+        // 轮询线程直接卡死 —— 表现是托盘再也不更新，看着像程序死了。
+        // 64 次远超正常残留包的个数，正常情况下一两次就 break
         let mut tmp = [0u8; 64];
-        while let Ok(k) = self.dev.read_timeout(&mut tmp, 5) {
-            if k == 0 {
-                break;
+        for _ in 0..64 {
+            match self.dev.read_timeout(&mut tmp, 5) {
+                Ok(k) if k > 0 => continue,
+                _ => break,
             }
         }
 

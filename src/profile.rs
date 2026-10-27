@@ -15,6 +15,14 @@ use std::path::{Path, PathBuf};
 
 use crate::hidpp::BatteryKind;
 
+/// `raw` 声明里 `reply_len` 的上限。
+///
+/// 不是防谁，是防手误：raw.rs 每一轮轮询都按这个值分配缓冲，
+/// 多打几个 0 就是每轮试图分配几个 GB，而 Rust 分配失败是 abort ——
+/// 一份写坏的声明能把程序带走，这不能接受。1024 远超任何真实 HID 报文
+/// （USB HID 中断端点单包最大 64 字节，厂商自定义接口也在这个量级）
+const MAX_REPLY_LEN: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     /// 罗技 HID++ 2.0
@@ -148,10 +156,25 @@ impl RawBattery {
             // 查表是顺序扫描，排序后可以让声明里的书写顺序不影响结果
             table.sort_by_key(|(s, _)| *s);
         }
+        let reply_len = self.reply_len.unwrap_or(20).max(request.len());
+        // 上限见 MAX_REPLY_LEN 的注释：这里的值直接决定每轮分配多大一块内存
+        if reply_len > MAX_REPLY_LEN {
+            return Err(format!(
+                "reply_len {reply_len} 太大（上限 {MAX_REPLY_LEN}）"
+            ));
+        }
+        let state_index = self.state_index.unwrap_or(value_index.saturating_sub(1));
+        // 下标越界不会崩，只会让这台设备**永远静默读不到** —— 「声明明明写了却认不出一台」
+        // 是这里最难查的一类问题，所以在编译期就拒掉，日志里留一句明确的
+        if value_index >= reply_len || state_index >= reply_len {
+            return Err(format!(
+                "字节下标越界：value_index={value_index}、state_index={state_index}，但 reply_len 只有 {reply_len}"
+            ));
+        }
         Ok(RawSpec {
-            reply_len: self.reply_len.unwrap_or(20).max(request.len()),
+            reply_len,
             request,
-            state_index: self.state_index.unwrap_or(value_index.saturating_sub(1)),
+            state_index,
             value_index,
             charging_states: self
                 .charging_states
@@ -390,18 +413,30 @@ fn same_target(a: &Profile, b: &Profile) -> bool {
 /// 为「检查设备声明更新」准备 —— 一次请求拿全部，而不是一台一个请求。
 /// 清单是**不可信输入**：整份解析不出来就报错，单份有问题只跳过那一份 ——
 /// 不能因为远程某一台写错了，就让所有人一台都同步不到。
+///
+/// 解析刻意分两段：先只做 YAML 语法解析，再逐份取值。若直接一次性
+/// `from_str::<Bundle>`，「某一份的字段类型写错」（vendor_id 忘了加引号变成整数、
+/// reply_len 写成字符串、table 里的数值超过 u8……）会让整份清单解析失败，
+/// 于是所有人一台都同步不到 —— 正好与这个函数要保证的东西相反。
 pub fn parse_bundle(text: &str) -> Result<Vec<Profile>, String> {
-    #[derive(Deserialize)]
-    struct Bundle {
-        #[serde(default)]
-        devices: Vec<Raw>,
-    }
-    let b: Bundle = serde_yml::from_str(text).map_err(|e| format!("清单不是合法 YAML：{e}"))?;
-    if b.devices.is_empty() {
+    let doc: serde_yml::Value =
+        serde_yml::from_str(text).map_err(|e| format!("清单不是合法 YAML：{e}"))?;
+    let devices = doc
+        .get("devices")
+        .and_then(|d| d.as_sequence())
+        .ok_or_else(|| "清单里没有 devices 列表".to_string())?;
+    if devices.is_empty() {
         return Err("清单里一份声明都没有".to_string());
     }
     let mut out = Vec::new();
-    for raw in b.devices {
+    for v in devices {
+        let raw: Raw = match serde_yml::from_value(v.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[profile] 远程清单里有一份声明字段不对，跳过：{e}");
+                continue;
+            }
+        };
         match raw.compile() {
             Ok(p) => out.push(p),
             Err(e) => warn!("[profile] 远程清单里有一份声明不对，跳过：{e}"),
@@ -973,6 +1008,82 @@ mod tests {
         let list = parse_bundle(text).expect("还剩一份能用的，不该整个失败");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "好设备");
+    }
+
+    #[test]
+    fn 字段类型写错也只跳过那一份() {
+        // reply_len 写成带引号的字符串（字段要整数）。这类**类型**错误以前会让
+        // 整份清单解析失败，于是所有人一台都同步不到 —— 和「坏一份跳一份」的承诺
+        // 正好相反。parse_bundle 因此改成分两段解析，这条测试守着它
+        let text = "devices:\
+            \n  - name: \"字段类型错的\"\
+            \n    protocol: \"raw\"\
+            \n    transport: \"direct\"\
+            \n    match:\
+            \n      vendor_id: \"0x0951\"\
+            \n      product_id: \"0x1723\"\
+            \n    battery:\
+            \n      request: \"21 FF 05\"\
+            \n      reply_len: \"20\"\
+            \n      value_index: 4\
+            \n  - name: \"好设备\"\
+            \n    protocol: \"ble\"\
+            \n    match:\
+            \n      vendor_id: \"0x045E\"\
+            \n      product_id: \"0x0B13\"\
+            \n    battery:\
+            \n      kind: \"percent\"\n";
+        let list = parse_bundle(text).expect("类型错的那一份不该拖垮整份清单");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "好设备");
+    }
+
+    #[test]
+    fn 报文长度过大或下标越界会被拒() {
+        // raw.rs 每轮都按 reply_len 分配缓冲，多打几个 0 就是每轮分配几个 GB；
+        // 而 Rust 分配失败是 abort —— 一份写坏的声明不该能把程序带走
+        let big = RawBattery {
+            feature: None,
+            kind: "percent".into(),
+            request: Some("21 FF 05".into()),
+            reply_len: Some(4_000_000_000),
+            state_index: None,
+            value_index: Some(4),
+            charging_states: None,
+            table: None,
+        };
+        assert!(big.compile_spec().is_err());
+
+        // 下标超出响应长度不会崩，只会让设备永远静默读不到 —— 比崩更难查，
+        // 所以在编译期就拒掉
+        let oob = RawBattery {
+            feature: None,
+            kind: "percent".into(),
+            request: Some("21 FF 05".into()),
+            reply_len: Some(20),
+            state_index: None,
+            value_index: Some(30),
+            charging_states: None,
+            table: None,
+        };
+        assert!(oob.compile_spec().is_err());
+
+        // 正常的一份不能受影响
+        let ok = RawBattery {
+            feature: None,
+            kind: "percent".into(),
+            request: Some("21 FF 05".into()),
+            reply_len: Some(20),
+            state_index: Some(3),
+            value_index: Some(4),
+            charging_states: None,
+            table: None,
+        };
+        let spec = ok.compile_spec().expect("20 字节、下标 3/4 是合法的");
+        assert_eq!(
+            (spec.reply_len, spec.state_index, spec.value_index),
+            (20, 3, 4)
+        );
     }
 
     #[test]

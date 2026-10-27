@@ -261,7 +261,15 @@ impl Dev {
         }
         let rd = DataReader::FromBuffer(&buf).ok()?;
         // 标准规定至少 1 字节，但也有设备多给几位，这里只读第一个
-        rd.ReadByte().ok()
+        let b = rd.ReadByte().ok()?;
+        // 0xFF 是蓝牙规范里「电量未知」的取值。不挡的话托盘会显示 255%，
+        // 而电量环会被 min(100) 兜住画成满圈 —— 等于把「没有数据」画成「满电」，
+        // 正是这个项目最不该犯的错。返回 None 就走既有的「读不到」路径：
+        // 灰环、两个短横，绝不用假数字凑
+        if b > 100 {
+            return None;
+        }
+        Some(b)
     }
 }
 

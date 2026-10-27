@@ -30,6 +30,14 @@ use crate::warn;
 /// HID++ 这类私有协议只会挂在那些接口上。
 const VENDOR_PAGE: u16 = 0xFF00;
 
+/// HID++ 2.0 长报文接口的 usage。
+///
+/// 罗技接收器会同时暴露 0xFF00:0x0001（短报文 7 字节）、0xFF00:0x0002（长报文 20 字节）
+/// 和 0xFF00:0x0004 三个厂商接口，**只有 0x0002 应答 HID++**。
+/// 对这个值做精确匹配，是为了让「导出一份设备信息」不必在每个不答话的接口上
+/// 白等一整轮超时
+const HIDPP_LONG_REPORT_USAGE: u16 = 0x0002;
+
 /// 程序当前显示着的设备（由 main 传进来，这里不自己去读一遍 ——
 /// 用户看到的和他要上报的必须是同一份事实）
 pub struct Known {
@@ -105,8 +113,18 @@ pub fn build(api: &HidApi, known: &[Known]) -> String {
             // HID++ 走厂商自定义接口（usage_page 从 0xFF00 起）。标准键鼠接口
             // （0x0001 通用桌面、0x000C 消费控制）不可能是它 —— 对着十几个标准接口
             // 逐个发探测，只是让「点一下导出」多等十几秒，信息量却是零
-            if info.usage_page() >= VENDOR_PAGE {
+            //
+            // 再收紧一层：厂商接口里也只有**长报文**那个（usage 0x0002）会答 HID++。
+            // 实测罗技接收器暴露的 0xFF00:0x0001（短报文 7 字节）与 0xFF00:0x0004
+            // 一律不回，问一次就是白等 300 ms × 槽位数。报告里如实写「未探测」，
+            // 而不是伪装成「没答应探测」—— 后者会让人以为设备坏了
+            if info.usage_page() >= VENDOR_PAGE && info.usage() == HIDPP_LONG_REPORT_USAGE {
                 let _ = writeln!(s, "      {}", hidpp_line(api, info));
+            } else if info.usage_page() >= VENDOR_PAGE {
+                let _ = writeln!(
+                    s,
+                    "      HID++：未探测（不是长报文接口，实测不应答；换用长报文接口那一条才问得出来）"
+                );
             } else {
                 let _ = writeln!(
                     s,

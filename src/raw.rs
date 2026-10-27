@@ -34,11 +34,14 @@ impl RawDev {
         let n = s.request.len().min(out.len());
         out[..n].copy_from_slice(&s.request[..n]);
 
-        // 清空遗留应答：上一次读留下的包会被当成这次的响应
+        // 清空遗留应答：上一次读留下的包会被当成这次的响应。
+        // 同 hidpp.rs 那边的道理，**必须有次数上限** —— 声明能匹配到会持续上报的
+        // 接口，无上限的「读到 0 才停」会让轮询线程永远转在这里
         let mut tmp = vec![0u8; 64];
-        while let Ok(k) = self.dev.read_timeout(&mut tmp, 5) {
-            if k == 0 {
-                break;
+        for _ in 0..64 {
+            match self.dev.read_timeout(&mut tmp, 5) {
+                Ok(k) if k > 0 => continue,
+                _ => break,
             }
         }
 
