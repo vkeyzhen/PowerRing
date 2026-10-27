@@ -26,7 +26,7 @@ Battery monitor for wireless peripherals on Windows. A ring in the tray tells yo
 | Auto discovery | Rescans the bus every 60 s: a device you switch on mid-session shows up on its own — **and for three minutes after something vanishes the pace tightens to every 10 s**, so switching it back on brings it straight back. A device that stops answering is marked *disconnected* and stays in the tray: it never reports a stale number, but it also does not disappear just because it dozed off |
 | Logs | `%APPDATA%\PowerRing\log.txt`, rotates above 1 MB |
 
-PowerRing asks each device once per poll interval (30 s by default), so **any change shows up at most one round later**: unplug a receiver and it drops off the tray within roughly 10–30 s, plug it back in and it returns on the next scan. That is deliberate — probing more often just to notice sooner wakes sleeping devices, which spends the battery we are trying to report on.
+PowerRing asks each device once per poll interval (60 s by default), so **any change shows up at most one round later**: unplug a receiver and it drops off the tray within roughly 30–60 s, plug it back in and it returns on the next scan. That is deliberate — probing more often just to notice sooner wakes sleeping devices, which spends the battery we are trying to report on. Shorten the interval in Settings if that feels slow.
 
 Settings expose the refresh interval, warning and critical thresholds, the alert toggle (with a "Test once" button so you can verify it immediately), start-with-Windows and the theme.
 
@@ -119,6 +119,10 @@ from the project, saves it locally, and it **takes effect immediately, no restar
 - Files land in `%APPDATA%\PowerRing\devices\synced-*.yaml`. **Do not hand-edit these** —
   the next sync overwrites them. To customise one, save a copy under a different name in the
   same folder; that one is left alone
+- When one device is described by several declarations (one inside the exe, one synced down,
+  one you wrote), only one is used, in this order: **yours → synced → bundled → auto-detected**.
+  That is why a synced correction can override the older copy bundled in the exe, which is what
+  makes this feature useful even for devices that were already supported
 - Cannot reach GitHub but still want this? Settings lets you enter an address you can reach;
   when set, it takes priority
 
