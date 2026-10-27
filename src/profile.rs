@@ -223,7 +223,9 @@ fn hex(s: &str) -> Option<u16> {
     u16::from_str_radix(t, 16).ok()
 }
 
-/// 解析单个字节 "0x0E" / "0E" / "231"
+/// 解析单个字节，一律按十六进制：`"0x0E"` / `"0E"`。
+/// 注意**不支持十进制** —— `"231"` 会被当成 0x231，超出 u8 于是报「不是合法十六进制」。
+/// 声明里的字节值全部照报文写，十六进制是唯一口径，混着来只会让换算表对不上号
 fn hex_byte(s: &str) -> Option<u8> {
     let t = s.trim().to_ascii_lowercase();
     let t = t.strip_prefix("0x").unwrap_or(&t);
@@ -376,8 +378,12 @@ fn rank_of(dir: &Path, name: &str) -> u8 {
 /// 拆分出来是为了能离线单测：真实目录结构没法在测试里摆出来，
 /// 而「谁盖住谁」恰恰是那种写反了也不报错、只在用户那儿表现为「同步没反应」的逻辑。
 fn merge(mut all: Vec<Loaded>) -> Vec<Profile> {
-    // 稳定排序：同层之内保持目录遍历顺序，行为可预期
-    all.sort_by_key(|l| l.rank);
+    // 先按可信度、再按文件名排序。
+    //
+    // 只按 rank 排是不够的：同 rank 的输入顺序来自 read_dir，而 NTFS 上它不保证有序 ——
+    // 同一个目录里放了两份描述同一设备的声明时，重启两次可能用的是不同那份，
+    // 日志里的「用了 X 跳过 Y」也就没法复现。拿文件名当第二关键字，行为才真的确定
+    all.sort_by(|a, b| (a.rank, &a.file).cmp(&(b.rank, &b.file)));
     let mut out: Vec<(Profile, String)> = Vec::new();
     for l in all {
         match out.iter().position(|(q, _)| same_target(q, &l.p)) {
@@ -521,7 +527,7 @@ fn slug(p: &Profile) -> String {
 /// 第三个值不能省：目录建不出来、磁盘满、`%APPDATA%` 只读时，前两个都是 0，
 /// 而「全都已经是最新」也是 0 —— 界面若只看前两个，就会在「一份都没写进去」时
 /// 报「已经是最新了」，用户重启后发现设备还是缺的，却不知道该怀疑什么。
-pub fn save_synced(list: &[Profile]) -> (usize, usize, usize) {
+pub fn save_synced(list: &[Profile], prune: bool) -> (usize, usize, usize) {
     let Some(dir) = user_devices_dir() else {
         warn!("[profile] 找不到用户声明目录（APPDATA 为空？）");
         return (0, 0, list.len());
@@ -584,14 +590,20 @@ pub fn save_synced(list: &[Profile]) -> (usize, usize, usize) {
             }
         }
     }
-    // 清理：本次清单里没有的 synced-* 全部删掉
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("synced-") && name.ends_with(".yaml") && !keep.contains(&name) {
-                match fs::remove_file(e.path()) {
-                    Ok(()) => info!("[profile] 远程清单里没有了，删掉旧的 {name}"),
-                    Err(err) => warn!("[profile] 删不掉 {name}：{err}"),
+    // 清理：本次清单里没有的 synced-* 全部删掉。
+    //
+    // `prune` 只在拉的是项目官方清单时为真。用户自己填了一个只含几台设备的镜像时
+    // 不能清理 —— 那份清单不完整是他的自由，但按它去删别人的 synced-* 就是
+    // 拿一份「不完整的权威」去覆盖「完整的权威」，结果是设备从面板上凭空消失
+    if prune {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("synced-") && name.ends_with(".yaml") && !keep.contains(&name) {
+                    match fs::remove_file(e.path()) {
+                        Ok(()) => info!("[profile] 远程清单里没有了，删掉旧的 {name}"),
+                        Err(err) => warn!("[profile] 删不掉 {name}：{err}"),
+                    }
                 }
             }
         }

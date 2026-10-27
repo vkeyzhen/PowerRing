@@ -105,7 +105,11 @@ fn sources(custom: Option<&str>) -> Vec<String> {
 fn apply(body: &str, source: &str) -> Result<Outcome, String> {
     let list = crate::profile::parse_bundle(body)?;
     let total = list.len();
-    let (added, updated, failed) = crate::profile::save_synced(&list);
+    // 只有拉的是项目官方清单时才按它清理本地已有的那份。
+    // 用户自填的镜像往往只含他自己那几台 —— 拿它去清理，会把官方清单同步来的
+    // 其它设备声明一起删掉，那些设备于是从面板上消失
+    let prune = source == PRIMARY || source == MIRROR;
+    let (added, updated, failed) = crate::profile::save_synced(&list, prune);
     Ok(Outcome {
         total,
         added,
