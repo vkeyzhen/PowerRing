@@ -121,6 +121,11 @@ fn smooth(shown: Option<u8>, fresh: u8) -> u8 {
     match shown {
         None => fresh,
         Some(s) if (fresh as i16 - s as i16).abs() >= 2 => fresh,
+        // 跨档例外：21% → 20% 只差 1，但 20% 正好压在默认警告线上。
+        // 压着不动的话界面停在 21%、提醒也不触发，而用户看一眼系统电量就是 20% ——
+        // 滞回是为了防抖，不该把「刚好跨过那条线」也一起吞掉。
+        // 这里用 charging=false 只比电量档，充电与否不参与判断
+        Some(s) if tier_of(Some(s), false) != tier_of(Some(fresh), false) => fresh,
         Some(s) => s,
     }
 }
@@ -232,7 +237,7 @@ fn popup_lines(list: &[Status]) -> Vec<Line> {
 ///
 /// 阈值读的是设置窗口里当前的值（settings::low_*），不写死 10/20 ——
 /// 否则用户把阈值改成 30，环色还是按 20 变橙，设置等于白改。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tier {
     Critical = 0,
     Warn = 1,
@@ -242,12 +247,16 @@ enum Tier {
 }
 
 fn tier_of(percent: Option<u8>, charging: bool) -> Tier {
-    match (percent, charging) {
-        (None, _) => Tier::Unknown,
-        (Some(_), true) => Tier::Charging,
-        (Some(p), false) if p <= settings::low_critical() => Tier::Critical,
-        (Some(p), false) if p <= settings::low_warn() => Tier::Warn,
-        _ => Tier::Normal,
+    // 顺序有讲究：**先比电量档，充电只在「不缺电」时才算一种状态**。
+    // 反过来的话，一台 5% 的鼠标一插上线就变蓝环 —— 红环本该说的是
+    // 「快没电了」，充电并不改变它现在缺电这个事实，蓝色反而把最该被看见的信号抹掉。
+    // （真事：另一台耳机在充电，把 5% 的鼠标红环染成了蓝色）
+    match percent {
+        None => Tier::Unknown,
+        Some(p) if p <= settings::low_critical() => Tier::Critical,
+        Some(p) if p <= settings::low_warn() => Tier::Warn,
+        Some(_) if charging => Tier::Charging,
+        Some(_) => Tier::Normal,
     }
 }
 
@@ -280,6 +289,22 @@ fn swatch_of(s: &Status) -> (u8, u8, u8) {
     match s.percent {
         None => (150, 150, 150), // 未知：灰
         Some(p) => color_of(p, s.charging),
+    }
+}
+
+/// 托盘那一圈该画成什么样：(显示的电量, 是否按「充电中」着色)。
+///
+/// 环只画一台 —— 电量最低的那台，因为它是唯一需要人动手的。颜色必须跟着**同一台**：
+/// 以前这里是「任意一台在充电就整环变蓝」，于是 5% 的鼠标会被旁边正在充电的耳机
+/// 染成蓝色，最该被看见的红环就这么没了。
+fn tray_ring(latest: &[Status]) -> (Option<u8>, bool) {
+    match latest
+        .iter()
+        .filter_map(|s| s.percent.map(|p| (p, s.charging)))
+        .min_by_key(|(p, _)| *p)
+    {
+        Some((p, c)) => (Some(p), c),
+        None => (None, false),
     }
 }
 
@@ -1367,9 +1392,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dark = theme::is_dark();
         if dark != seen_dark {
             seen_dark = dark;
-            let lowest = latest.iter().filter_map(|s| s.percent).min();
-            let any_charging = latest.iter().any(|s| s.charging);
-            if let Err(e) = tray.set_icon(Some(ring_icon(lowest, any_charging))) {
+            let (ring_pct, ring_charging) = tray_ring(&latest);
+            if let Err(e) = tray.set_icon(Some(ring_icon(ring_pct, ring_charging))) {
                 warn!("[tray] 换配色后重设图标失败：{e}");
             }
             popup::repaint();
@@ -1385,10 +1409,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if changed {
             // tooltip 逐台列出；托盘图标取**电量最低**的那台（最需要被看到的那个）
             let tip = tooltip_of(&latest);
-            let lowest = latest.iter().filter_map(|s| s.percent).min();
-            let any_charging = latest.iter().any(|s| s.charging);
+            let (ring_pct, ring_charging) = tray_ring(&latest);
 
-            if let Err(e) = tray.set_icon(Some(ring_icon(lowest, any_charging))) {
+            if let Err(e) = tray.set_icon(Some(ring_icon(ring_pct, ring_charging))) {
                 warn!("[tray] set_icon 失败：{e}");
             }
             if let Err(e) = tray.set_tooltip(Some(&tip)) {
@@ -1414,7 +1437,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tooltip_of, Status, SUBMIT_URL, TIP_MAX_CHARS};
+    use super::{smooth, tier_of, tooltip_of, tray_ring, Status, Tier, SUBMIT_URL, TIP_MAX_CHARS};
+    use crate::settings;
 
     /// 收集页的链接是写死在程序里的，改的时候容易手滑：
     /// 少个 s、多截一个字符，点下去就是 404，而这个错只有真去点才会发现。
@@ -1518,5 +1542,50 @@ mod tests {
             "悬停文字 {} 字符，超过上限 {TIP_MAX_CHARS}",
             t.chars().count()
         );
+    }
+
+    /// 红环说的是「缺电」，插上线并不改变这个事实 —— 5% 在充电仍是严重档。
+    /// 守的是 issue #11：以前充电优先，低电档一并变蓝，最该被看见的信号消失了
+    #[test]
+    fn 低电档在充电时仍然是严重档() {
+        assert_eq!(tier_of(Some(5), true), Tier::Critical);
+        assert_eq!(tier_of(Some(15), true), Tier::Warn);
+        // 不缺电时充电才是一种状态
+        assert_eq!(tier_of(Some(80), true), Tier::Charging);
+        assert_eq!(tier_of(Some(80), false), Tier::Normal);
+    }
+
+    /// 托盘只有一圈，谁的颜色都不能借：以前是「任意一台在充电就整环变蓝」，
+    /// 于是 5% 的鼠标被旁边充电的耳机染成蓝色（issue #11）
+    #[test]
+    fn 托盘环只跟随电量最低那台() {
+        let mouse = s("鼠标", "鼠标", Some(5));
+        let mut earphone = s("耳机", "耳机", Some(80));
+        earphone.charging = true;
+        assert_eq!(tray_ring(&[mouse, earphone]), (Some(5), false));
+
+        // 最低的那台自己在充电，才画蓝环
+        let mut mouse = s("鼠标", "鼠标", Some(80));
+        mouse.charging = true;
+        assert_eq!(tray_ring(&[mouse]), (Some(80), true));
+
+        // 一台都给不出数：灰环，不是「0%」
+        assert_eq!(tray_ring(&[offline("GPW", "GPW")]), (None, false));
+    }
+
+    /// 滞回是为了防抖，不该把「刚好跨过阈值」也吞掉（issue #9）：
+    /// 21% → 20% 只差 1 个点，但 20% 正是默认警告线，压着不动就等于漏报
+    #[test]
+    fn 跨档时滞回让路() {
+        let warn = settings::low_warn();
+        assert_eq!(
+            smooth(Some(warn.saturating_add(1)), warn),
+            warn,
+            "跨过警告线必须更新"
+        );
+        // 同一档内差 1 仍然压着，否则 27% 和 28% 会来回横跳
+        assert_eq!(smooth(Some(50), 49), 50);
+        // 差 2 个点照常更新
+        assert_eq!(smooth(Some(50), 52), 52);
     }
 }

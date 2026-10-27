@@ -222,7 +222,11 @@ fn scan_ble(prof: &Profile, seen: &mut HashSet<String>, out: &mut Vec<Device>) {
         if !dev.probe() {
             continue;
         }
-        let key = format!("ble#{:04X}-{:04X}", node.vid, node.pid);
+        // 去重键用接口路径而不是「VID-PID」：两只同型号手柄（比如一黑一白）
+        // VID/PID 完全一样，按型号去重会让其中一只永远不出现在面板上。
+        // 同一物理设备被多份声明匹配时路径相同，照样只留一台。
+        // `seen` 是每轮扫描新建的（见 `scan`），所以这里不需要跨轮稳定
+        let key = format!("ble#{}", node.id);
         if !seen.insert(key) {
             continue;
         }

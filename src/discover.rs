@@ -38,9 +38,10 @@ const BATTERY_FEATURES: [(u16, BatteryKind); 2] = [
 /// 直连设备（插线、或接收器已与设备配对成一台）用的 device index。
 /// M2 实测：直连时不挑 index，0x00–0xFF 全都响应，用 1 即可。
 pub(crate) const DIRECT_IDX: u8 = 1;
-/// 用来分辨接收器与直连设备的那个 index：故意取一个不是 1 的值，
-/// 只有「不挑 index 的直连设备」才会理它（见 `looks_direct`）
+/// 用来分辨接收器与直连设备的两个 index：刻意取不是 1 的值，
+/// 只有「不挑 index 的直连设备」才会**两个都**理（见 `looks_direct`）
 const PROBE_IDX: u8 = 2;
+const PROBE_IDX_2: u8 = 3;
 /// 接收器上要逐个问的 slot。slot 会漂移（实测 GPW 从 3 漂到 2），所以全覆盖
 const RECEIVER_SLOTS: std::ops::RangeInclusive<u8> = 1..=6;
 
@@ -135,15 +136,22 @@ fn merge_by_feature(found: &[(u8, u16, BatteryKind)]) -> Vec<(u16, BatteryKind, 
 ///
 /// 判据：直连设备对每个 device index 都应答（M2 实测 0x00–0xFF 全响应，
 /// 回显请求里的 index），而接收器只对**已配对**的 slot 应答。
-/// 于是拿一个不是 1 的 index 去问：它答应，说明这个接口不挑 index，是直连。
+///
+/// 所以不能只问一个 index 就下结论 —— 接收器的 slot 2 上正好挂着一台设备时，
+/// `index 2` 也会答应，于是一个 slot 1 + slot 2 各有一台设备的接收器会被判成直连，
+/// 结果只按 index 1 读，slot 2 那台永远发现不了。要**两个不同的非 1 index 都答应**
+/// 才算直连：接收器的 slot 2 和 slot 3 同时都有设备才会误判，概率低得多。
 ///
 /// 分错的代价并不对称：接收器被当成直连，就只按 index 1 读 —— 设备漂到别的 slot
 /// 就再也读不到（实测 GPW 的 slot 会漂）；直连被当成接收器，只是多问几个空 slot，
 /// 慢一点但结果一样。所以拿不准时宁可判成接收器。
+///
+/// 代价是多一次探测报文，但只在「自动发现」里走（启动首轮或列表为空时），
+/// 不是每轮轮询都付。
 pub(crate) fn looks_direct(conn: &Hidpp) -> bool {
-    BATTERY_FEATURES
-        .iter()
-        .any(|(f, _)| conn.feature_index(PROBE_IDX, *f).is_some())
+    BATTERY_FEATURES.iter().any(|(f, _)| {
+        conn.feature_index(PROBE_IDX, *f).is_some() && conn.feature_index(PROBE_IDX_2, *f).is_some()
+    })
 }
 
 /// 显示名：**设备自报的**那个优先。
