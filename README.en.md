@@ -28,7 +28,7 @@ Battery monitor for wireless peripherals on Windows. A ring in the tray tells yo
 
 PowerRing asks each device once per poll interval (60 s by default), so **any change shows up at most one round later**: unplug a receiver and it drops off the tray within roughly 30–60 s, plug it back in and it returns on the next scan. That is deliberate — probing more often just to notice sooner wakes sleeping devices, which spends the battery we are trying to report on. Shorten the interval in Settings if that feels slow.
 
-Settings expose the refresh interval, warning and critical thresholds, the alert toggle (with a "Test once" button so you can verify it immediately), start-with-Windows and the theme.
+Settings expose the refresh interval, warning and critical thresholds, the alert toggle (with a "Test once" button so you can verify it immediately), start-with-Windows, the theme, and the custom URL used by "Check for declaration updates" (only needed when GitHub is unreachable). The keyboard works too: Tab moves between controls, Enter saves, Esc closes without saving.
 
 ## Verified devices
 
