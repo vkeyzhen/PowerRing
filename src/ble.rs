@@ -40,7 +40,7 @@ use windows::Devices::Bluetooth::{
 use windows::Devices::Enumeration::DeviceInformation;
 use windows::Storage::Streams::DataReader;
 
-use crate::hidpp::Battery;
+use crate::hidpp::{Battery, ReadingSource};
 use crate::{info, warn};
 
 /// 0x2A19 Battery Level
@@ -168,11 +168,12 @@ impl Dev {
         if !matches!(self.presence(), Presence::Connected) {
             return None;
         }
-        let percent = self.raw()?;
+        let (percent, source) = self.raw()?;
         Some(Battery {
-            percent,
+            percent: Some(percent),
             mv: 0,
             charging: false,
+            source,
         })
     }
 
@@ -242,11 +243,16 @@ impl Dev {
         }
     }
 
-    fn raw(&self) -> Option<u8> {
+    fn raw(&self) -> Option<(u8, ReadingSource)> {
         // 先真去设备上读一次；连不上（比如它刚好溜去休眠了）就退回系统缓存里
-        // 那个值 —— 陈旧，但比让设备凭空消失好
-        self.read(BluetoothCacheMode::Uncached)
-            .or_else(|| self.read(BluetoothCacheMode::Cached))
+        // 那个值 —— 陈旧，但比让设备凭空消失好。
+        // 两条路都带上来源：实时读和缓存值在界面上长得一样，
+        // 而「这个 100% 是刚才读的，还是系统三个月前的旧账」差别很大
+        if let Some(v) = self.read(BluetoothCacheMode::Uncached) {
+            return Some((v, ReadingSource::Live));
+        }
+        self.read(BluetoothCacheMode::Cached)
+            .map(|v| (v, ReadingSource::SystemCache))
     }
 
     fn read(&self, mode: BluetoothCacheMode) -> Option<u8> {

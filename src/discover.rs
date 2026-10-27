@@ -58,7 +58,10 @@ const PLAUSIBLE_MV: std::ops::RangeInclusive<u16> = 2500..=5000;
 fn plausible(b: &Battery, kind: BatteryKind) -> bool {
     match kind {
         BatteryKind::Voltage => PLAUSIBLE_MV.contains(&b.mv),
-        BatteryKind::Percent => true,
+        // 百分比式必须**真的给出一个百分比**。应答了却没给数（比如设备只支持
+        // 粗档位、能力位说不支持百分比），那不叫「读到了」，认下来只会让用户
+        // 看到一台永远「--」的设备
+        BatteryKind::Percent => b.percent.is_some_and(|p| p <= 100),
     }
 }
 
@@ -373,35 +376,57 @@ fn hidpp_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hidpp::Battery;
+    use crate::hidpp::{Battery, ReadingSource};
 
     #[test]
     fn 电压式只认像电压的数() {
         let good = Battery {
-            percent: 88,
+            percent: Some(88),
             mv: 4050,
             charging: false,
+            source: ReadingSource::Live,
         };
         let zero = Battery {
-            percent: 0,
+            percent: Some(0),
             mv: 0,
             charging: false,
+            source: ReadingSource::Live,
         };
         assert!(plausible(&good, BatteryKind::Voltage));
         assert!(!plausible(&zero, BatteryKind::Voltage));
         // 边界：锂电放空与满电的两端都要算合理
         let low = Battery {
-            percent: 1,
+            percent: Some(1),
             mv: 2500,
             charging: false,
+            source: ReadingSource::Live,
         };
         let high = Battery {
-            percent: 100,
+            percent: Some(100),
             mv: 5000,
             charging: false,
+            source: ReadingSource::Live,
         };
         assert!(plausible(&low, BatteryKind::Voltage));
         assert!(plausible(&high, BatteryKind::Voltage));
+    }
+
+    /// 应答了但没有百分比，不能算「认出来了」：
+    /// 认下来会写进声明，之后这台设备就一直显示「--」
+    #[test]
+    fn 没有百分比的百分比式设备不算认出来() {
+        let unknown = Battery {
+            percent: None,
+            mv: 0,
+            charging: true,
+            source: ReadingSource::Live,
+        };
+        assert!(!plausible(&unknown, BatteryKind::Percent));
+        let real = Battery {
+            percent: Some(64),
+            ..unknown
+        };
+        assert!(plausible(&real, BatteryKind::Percent));
     }
 
     /// 归并规则是这次改动的全部内容，而它没法靠「插两台设备」稳定复现

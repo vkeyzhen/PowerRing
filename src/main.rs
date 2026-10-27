@@ -41,6 +41,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::config::Config;
+use crate::hidpp::ReadingSource;
 use crate::popup::Line;
 use crate::profile::Profile;
 
@@ -51,6 +52,9 @@ struct Status {
     short: String,
     percent: Option<u8>,
     charging: bool,
+    /// 这个百分比是从哪儿来的：刚读的 / 系统缓存 / 上一轮的旧账。
+    /// 面板与悬停文字都要标出来 —— 三种来源在界面上原本长得一模一样
+    source: ReadingSource,
     /// 联系不上，但承载它的接收器还在机器上 —— 多半是休眠或关机。
     /// 显示为「未连接」而不是把设备删掉：删了的话鼠标每次睡深一点都要重新出现一次
     offline: bool,
@@ -192,6 +196,25 @@ fn tooltip_of(list: &[Status]) -> String {
     parts.join(" · ")
 }
 
+/// 读书来源在界面上怎么标。实时读数不标 —— 那是默认情况，标了只是噪音；
+/// 另外两种必须标，因为用户看到的数字其实是旧值
+fn source_note(source: ReadingSource) -> &'static str {
+    match source {
+        ReadingSource::Live => "",
+        ReadingSource::SystemCache => "（系统缓存）",
+        ReadingSource::Previous => "（上次读数）",
+    }
+}
+
+/// 日志里用的说法，比界面上的短
+fn source_name(source: ReadingSource) -> &'static str {
+    match source {
+        ReadingSource::Live => "实时",
+        ReadingSource::SystemCache => "系统缓存",
+        ReadingSource::Previous => "上次读数",
+    }
+}
+
 fn tip_line(s: &Status, name: &str) -> String {
     if s.offline {
         // 说「未连接」而不是给个数：那个数是它睡着之前读到的，
@@ -199,7 +222,16 @@ fn tip_line(s: &Status, name: &str) -> String {
         return format!("{}（未连接）", name);
     }
     match s.percent {
-        Some(p) => format!("{} {}%{}", name, p, if s.charging { " 充电" } else { "" }),
+        Some(p) => format!(
+            "{} {}%{}{}",
+            name,
+            p,
+            if s.charging { " 充电" } else { "" },
+            source_note(s.source)
+        ),
+        // 充着电但拿不到百分比：别写「--」让人以为是没读到，
+        // 也别编个 100% —— 它就是在充电，只是不知道充到哪儿了
+        None if s.charging => format!("{} 充电中（电量未知）", name),
         None => format!("{} --", name),
     }
 }
@@ -220,11 +252,13 @@ fn popup_lines(list: &[Status]) -> Vec<Line> {
             } else {
                 match s.percent {
                     Some(p) => format!(
-                        "{}  {}%{}",
+                        "{}  {}%{}{}",
                         s.name,
                         p,
-                        if s.charging { "  充电中" } else { "" }
+                        if s.charging { "  充电中" } else { "" },
+                        source_note(s.source)
                     ),
+                    None if s.charging => format!("{}  充电中（电量未知）", s.name),
                     None => format!("{}  --", s.name),
                 }
             },
@@ -484,6 +518,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dev: device::Device,
             percent: Option<u8>,
             charging: bool,
+            /// 这个读数是刚读的、系统缓存的，还是这一轮没读到沿用的上次值
+            source: ReadingSource,
             /// 两档提醒各自的弹药
             arm_critical: Arm,
             arm_warn: Arm,
@@ -672,6 +708,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dev: d,
                 percent: None,
                 charging: false,
+                source: ReadingSource::Live,
                 arm_critical: Arm::Armed,
                 arm_warn: Arm::Armed,
                 misses: 0,
@@ -715,6 +752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             dev: d,
                             percent: None,
                             charging: false,
+                            source: ReadingSource::Live,
                             arm_critical: Arm::Armed,
                             arm_warn: Arm::Armed,
                             misses: 0,
@@ -760,6 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dev: d,
                         percent: None,
                         charging: false,
+                        source: ReadingSource::Live,
                         arm_critical: Arm::Armed,
                         arm_warn: Arm::Armed,
                         misses: 0,
@@ -778,17 +817,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         w.detached = false;
                         // 是不是这台设备的第一次读数：弹药的初始状态由它决定
                         let fresh = w.percent.is_none();
-                        if w.percent.map(|p| p != b.percent).unwrap_or(true) {
-                            info!("[battery] {} → {} mV {}%", w.dev.name, b.mv, b.percent);
+                        if w.percent != b.percent {
+                            info!(
+                                "[battery] {} → {} mV {:?}%（来源：{}）",
+                                w.dev.name,
+                                b.mv,
+                                b.percent,
+                                source_name(b.source)
+                            );
                         }
-                        w.percent = Some(smooth(w.percent, b.percent));
+                        // 只在读到了数字时做滞回；读不到就是读不到（None）
+                        w.percent = b.percent.map(|p| smooth(w.percent, p));
                         w.charging = b.charging;
+                        w.source = b.source;
                         if let Some(a) = check_alert(w, fresh) {
                             alerts.push(a);
                         }
                     }
                     // 读失败：保留上一次的值。绝不用 0% 表示「读不到」（PRD §2.3）
                     None => {
+                        // 这一轮没读到：留下的那个数就是「上次读数」。
+                        // 界面上要说清楚，否则用户会把旧账当成现在的状态
+                        w.source = ReadingSource::Previous;
                         // 「读不到电量」不等于「设备没了」，先问一句再决定算不算数。
                         // 设备浅睡时（实测 GPW 静止一段时间后就是这样）探测照样答应，
                         // 只是不回答电量请求。这种情况让它留在列表里、保留上次读数 ——
@@ -877,6 +927,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     percent: if w.offline { None } else { w.percent },
                     charging: w.charging && !w.offline,
                     offline: w.offline,
+                    source: w.source,
                 })
                 .collect::<Vec<_>>();
             if tx.send(snap).is_err() {
@@ -1437,7 +1488,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{smooth, tier_of, tooltip_of, tray_ring, Status, Tier, SUBMIT_URL, TIP_MAX_CHARS};
+    use super::{
+        popup_lines, smooth, tier_of, tip_line, tooltip_of, tray_ring, Status, Tier, SUBMIT_URL,
+        TIP_MAX_CHARS,
+    };
+    use crate::hidpp::ReadingSource;
     use crate::settings;
 
     /// 收集页的链接是写死在程序里的，改的时候容易手滑：
@@ -1463,6 +1518,7 @@ mod tests {
             percent: pct,
             charging: false,
             offline: false,
+            source: ReadingSource::Live,
         }
     }
 
@@ -1474,6 +1530,7 @@ mod tests {
             percent: None,
             charging: false,
             offline: true,
+            source: ReadingSource::Live,
         }
     }
 
@@ -1481,6 +1538,31 @@ mod tests {
     fn 单设备用全名() {
         let t = tooltip_of(&[s("Logitech G PRO Wireless", "GPW", Some(18))]);
         assert_eq!(t, "Logitech G PRO Wireless 18%");
+    }
+
+    /// 数字背后是「刚读的」还是「系统缓存 / 上次读数」，界面必须说出来。
+    /// 三种来源原本长得一模一样，用户没法判断这个 100% 值不值得信
+    #[test]
+    fn 非实时读数会标出来源() {
+        let mut cached = s("Xbox 手柄", "手柄", Some(80));
+        cached.source = ReadingSource::SystemCache;
+        assert_eq!(tip_line(&cached, "Xbox 手柄"), "Xbox 手柄 80%（系统缓存）");
+
+        let mut old = s("GPW", "GPW", Some(71));
+        old.source = ReadingSource::Previous;
+        assert_eq!(tip_line(&old, "GPW"), "GPW 71%（上次读数）");
+
+        // 实时读数是常态，不标 —— 每个数字后面挂个「（实时）」只是噪音
+        assert_eq!(tip_line(&s("GPW", "GPW", Some(71)), "GPW"), "GPW 71%");
+    }
+
+    /// 充着电但拿不到百分比：说「电量未知」，不能编 100%，也不能装作没读到
+    #[test]
+    fn 充电但读不到电量时不编数字() {
+        let mut c = s("HyperX 天箭", "天箭", None);
+        c.charging = true;
+        assert_eq!(tip_line(&c, "天箭"), "天箭 充电中（电量未知）");
+        assert_eq!(popup_lines(&[c])[0].text, "HyperX 天箭  充电中（电量未知）");
     }
 
     #[test]

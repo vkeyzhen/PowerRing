@@ -11,7 +11,7 @@
 
 use hidapi::HidDevice;
 
-use crate::hidpp::Battery;
+use crate::hidpp::{Battery, ReadingSource};
 use crate::profile::RawSpec;
 
 pub struct RawDev {
@@ -61,16 +61,19 @@ impl RawDev {
         let charging = s.charging_states.contains(&state);
 
         let percent = if charging {
-            // 充电中：数值字节在这个状态下不代表电量，直接按满格显示。
-            // 环色会走「充电」那一档，具体数字不那么重要
+            // 充电中：数值字节在这个状态下不代表电量（它是另一张表的档位），
+            // 直接按满格显示。**这是已知问题**，仓库 issue #10 记着：
+            // 准确的做法是「不知道」，但它会让充电中的耳机从蓝环变成灰环，
+            // 显示语义要先定下来再改
             100
         } else {
             lookup(&s.table, state, value)?
         };
         Some(Battery {
-            percent,
+            percent: Some(percent),
             mv: 0,
             charging,
+            source: ReadingSource::Live,
         })
     }
 
