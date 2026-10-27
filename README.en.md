@@ -231,6 +231,10 @@ Output: `target/release/powerring.exe` (~1 MB).
 - Bluetooth Battery Level carries a single percentage byte with **no charging flag**, so these devices never show as charging
 - **Bluetooth devices enter and leave the list by whether they are connected right now**: drop the link and they fall off, reconnect and they come back. A powered-off controller no longer sits in the tray forever. When a live read fails we fall back to the system cache (possibly stale) rather than dropping a device that is in use
 - When a reading fails the ring turns grey instead of guessing
+- **Every number says where it came from**: the panel and the tooltip mark readings as
+  "system cache" or "last reading"; an unmarked number is one that was really just read.
+  When a device cannot report a percentage, or the value means nothing while charging,
+  it says "unknown" instead of inventing a number
 
 ## Your device is not in that table
 
