@@ -13,7 +13,7 @@
 //! 两张卡片共用一个窗口类和一个 wndproc：wndproc 拿不到闭包上下文，
 //! 卡片索引只能靠比对 HWND 反查（只有两张，比存 GWLP_USERDATA 简单）。
 
-use crate::info;
+use crate::{info, warn};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -28,9 +28,9 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, RegisterClassW, SetWindowPos,
-    ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
-    WM_LBUTTONDOWN, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSW, WS_BORDER, WS_EX_TOOLWINDOW,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, IsWindowVisible, RegisterClassW,
+    SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNA, WM_LBUTTONDOWN, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSW, WS_BORDER, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -122,6 +122,15 @@ static LINES: [Mutex<Rows>; N] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())
 static TITLES: [Mutex<String>; N] = [Mutex::new(String::new()), Mutex::new(String::new())];
 static VISIBLE: [AtomicBool; N] = [AtomicBool::new(false), AtomicBool::new(false)];
 static SHOWN_AT: [Mutex<Option<Instant>>; N] = [Mutex::new(None), Mutex::new(None)];
+/// 锚点矩形：(x, y, 宽, 高)。托盘图标用它，光标位置也用它（宽高给 0）
+type Anchor = (i32, i32, i32, i32);
+
+/// 这张卡片是按哪个锚点放出来的。
+///
+/// 内容变化后要重新摆一次位置 —— 行数变多、最长那行变长，窗口会往右下角长，
+/// 而屏幕边缘不会跟着动。只改尺寸不重算坐标的话，托盘在右下角时
+/// 右边一截和底下一行会被切在屏幕外（真的发生过：插上一台名字更长的设备就露馅）。
+static ANCHOR: [Mutex<Option<Anchor>>; N] = [Mutex::new(None), Mutex::new(None)];
 
 fn hwnd(idx: usize) -> HWND {
     HWND(HWS[idx].load(Ordering::SeqCst) as *mut core::ffi::c_void)
@@ -196,10 +205,27 @@ pub fn show_near_cursor(lines: Vec<Line>) {
 /// anchor 是托盘图标的位置。给不出来时用主屏右下角 —— 刻意**不用光标**：
 /// 提醒是程序主动冒出来的，而用户这会儿多半在副屏上干别的事，
 /// 跟着光标就会弹到副屏去，托盘却在另一块屏上，等于提醒跟主体脱节。
-pub fn alert(lines: Vec<Line>, title: &str, anchor: Option<(i32, i32, i32, i32)>) {
+pub fn alert(lines: Vec<Line>, title: &str, anchor: Option<Anchor>) {
+    alert_card(lines, title, anchor, false);
+}
+
+/// 设置窗口里那个「试一次」走这条路。
+///
+/// 它要的就是看见卡片长什么样，所以面板开着也照弹 —— 早退条件对自动提醒是对的，
+/// 但把「试一次」也挡掉就变成：用户点了按钮，屏幕上一动不动，
+/// 只有日志里一句「面板已开着，跳过提醒」，他只会以为按钮坏了。
+pub fn alert_forced(lines: Vec<Line>, title: &str, anchor: Option<Anchor>) {
+    alert_card(lines, title, anchor, true);
+}
+
+fn alert_card(lines: Vec<Line>, title: &str, anchor: Option<Anchor>, force: bool) {
     if VISIBLE[PANEL].load(Ordering::SeqCst) {
-        info!("[alert] 面板已开着，跳过提醒");
-        return;
+        if !force {
+            info!("[alert] 面板已开着，跳过提醒");
+            return;
+        }
+        // 让开位置：两张卡片叠在一起，提醒就被面板盖住了，等于没弹
+        hide_card(PANEL);
     }
     if let Ok(mut g) = TITLES[ALERT].lock() {
         *g = title.to_string();
@@ -215,6 +241,28 @@ pub fn alert(lines: Vec<Line>, title: &str, anchor: Option<(i32, i32, i32, i32)>
     place(ALERT, lines, x, y, w, h)
 }
 
+/// 按锚点算卡片的最终位置（已夹进可见区域）。
+///
+/// 抽出来是因为有两处要用：`place()` 第一次摆，`refresh_card()` 内容变大后重摆。
+/// 以前只有前者算过这道夹取，后者只改尺寸不动坐标 —— 于是面板开着的时候插上
+/// 一台名字更长的设备，右边一截和最下面一行就被切在屏幕外了
+fn clamp_pos(w: i32, h: i32, icon_x: i32, icon_y: i32, icon_w: i32, icon_h: i32) -> (i32, i32) {
+    let (vx, vy, vw, vh) = ui::virtual_screen();
+    let min_x = vx + 8;
+    let min_y = vy + 8;
+    // 托盘通常在屏幕右下角，默认往上弹；上方真的放不下才翻到下方
+    let x = icon_x + icon_w / 2 - w / 2;
+    let mut y = icon_y - h - 6;
+    if y < min_y {
+        y = icon_y + icon_h + 6;
+    }
+    // 夹在可见区域内：托盘贴着边时宁可整个面板往里挪，也不要被裁掉一块。
+    // 夹取范围用虚拟桌面而不是主屏 —— 用户是双屏，托盘可能在副屏。
+    let max_x = (vx + vw - w - 8).max(min_x);
+    let max_y = (vy + vh - h - 8).max(min_y);
+    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+}
+
 fn place(idx: usize, lines: Vec<Line>, icon_x: i32, icon_y: i32, icon_w: i32, icon_h: i32) {
     let title = TITLES[idx].lock().map(|g| g.clone()).unwrap_or_default();
     let texts: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
@@ -225,33 +273,21 @@ fn place(idx: usize, lines: Vec<Line>, icon_x: i32, icon_y: i32, icon_w: i32, ic
             .map(|l| (l.text, l.swatch))
             .collect::<Vec<_>>();
     }
+    // 记下锚点：内容变化后要按同一个锚点重算位置（见 refresh_card）
+    if let Ok(mut g) = ANCHOR[idx].lock() {
+        *g = Some((icon_x, icon_y, icon_w, icon_h));
+    }
     let hw = hwnd(idx);
     let (vx, vy, vw, vh) = ui::virtual_screen();
-    let min_x = vx + 8;
-    let min_y = vy + 8;
-    // 托盘通常在屏幕右下角，默认往上弹；上方真的放不下才翻到下方
-    let mut x = icon_x + icon_w / 2 - w / 2;
-    let mut y = icon_y - height - 6;
-    if y < min_y {
-        y = icon_y + icon_h + 6;
-    }
-    // 夹在可见区域内：托盘贴着边时宁可整个面板往里挪，也不要被裁掉一块。
-    // 夹取范围用虚拟桌面而不是主屏 —— 用户是双屏，托盘可能在副屏。
-    let max_x = (vx + vw - w - 8).max(min_x);
-    let max_y = (vy + vh - height - 8).max(min_y);
-    let target = (x, y);
-    x = x.clamp(min_x, max_x);
-    y = y.clamp(min_y, max_y);
+    let (x, y) = clamp_pos(w, height, icon_x, icon_y, icon_w, icon_h);
     // 位置日志是主要诊断手段 —— AI 看不到屏幕，只能靠数字对
     info!(
-        "[{}] 锚点=({},{}) 尺寸 {}x{} → 想放=({},{}) 实际=({},{}) 桌面=({},{},{},{})",
+        "[{}] 锚点=({},{}) 尺寸 {}x{} → 实际=({},{}) 桌面=({},{},{},{})",
         if idx == PANEL { "popup" } else { "alert" },
         icon_x,
         icon_y,
         w,
         height,
-        target.0,
-        target.1,
         x,
         y,
         vx,
@@ -260,10 +296,20 @@ fn place(idx: usize, lines: Vec<Line>, icon_x: i32, icon_y: i32, icon_w: i32, ic
         vh
     );
     unsafe {
-        let _ = SetWindowPos(hw, Some(HWND_TOPMOST), x, y, w, height, SWP_NOACTIVATE);
+        if let Err(e) = SetWindowPos(hw, Some(HWND_TOPMOST), x, y, w, height, SWP_NOACTIVATE) {
+            warn!("[popup] 摆位置失败，这张卡片这次不显示：{e}");
+            return;
+        }
         let _ = ShowWindow(hw, SW_SHOWNA);
         // 尺寸变了，强制重绘一次，否则会残留上一帧
         let _ = InvalidateRect(Some(hw), None, true);
+        // 真的显示出来了才算「可见」。以前是无条件置位：万一没显示成，
+        // is_visible() 报真，下一次点托盘走的是 hide() 分支 —— 用户要点两次才有反应，
+        // 低电量提醒也会因为「面板正开着」被静默跳过
+        if !IsWindowVisible(hw).as_bool() {
+            warn!("[popup] 窗口没能显示出来（ShowWindow 之后仍不可见）");
+            return;
+        }
     }
     VISIBLE[idx].store(true, Ordering::SeqCst);
     if let Ok(mut g) = SHOWN_AT[idx].lock() {
@@ -322,18 +368,22 @@ fn refresh_card(idx: usize, lines: Vec<Line>) {
             .collect::<Vec<_>>();
     }
     // 行数可能变了（插拔设备），窗口尺寸得跟着走：
-    // 只重绘不改尺寸的话，少一台会留一片空行，多一台会把最后一行裁掉
+    // 只重绘不改尺寸的话，少一台会留一片空行，多一台会把最后一行裁掉。
+    // 位置也必须按当初那个锚点重算 —— 贴着屏幕右下角的卡片只会越长越往右下长，
+    // 光改尺寸不挪位置，多出来的那部分就在屏幕外面
+    let pos = ANCHOR[idx]
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|(ax, ay, aw, ah)| clamp_pos(w, h, ax, ay, aw, ah));
     unsafe {
         let hw = hwnd(idx);
-        let _ = SetWindowPos(
-            hw,
-            None,
-            0,
-            0,
-            w,
-            h,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        // 没有锚点（理论上不会）就退回老行为：只改尺寸
+        let (x, y, flags) = match pos {
+            Some((x, y)) => (x, y, SWP_NOZORDER | SWP_NOACTIVATE),
+            None => (0, 0, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE),
+        };
+        let _ = SetWindowPos(hw, None, x, y, w, h, flags);
         let _ = InvalidateRect(Some(hw), None, true);
     }
 }

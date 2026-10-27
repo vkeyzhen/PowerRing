@@ -13,12 +13,20 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 单个日志文件上限。超过就滚一次：log.txt → log.1.txt，旧的 log.1.txt 直接丢
 const MAX_BYTES: u64 = 1024 * 1024;
+/// 滚动失败后等多久再试。
+///
+/// 失败通常是「文件被别的程序开着」或目录只读，这种状态一分钟内不会自己好转。
+/// 不设退避的话，每写一行日志都要先删一次旧档、再改一次名、再打开一次文件 ——
+/// 而这类机器上日志本来就写得最多
+const ROTATE_BACKOFF: Duration = Duration::from_secs(60);
 
 static WRITER: Mutex<Option<fs::File>> = Mutex::new(None);
+/// 上次滚动失败的时刻，用来做退避
+static ROTATE_FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// 打开日志文件。失败时不可用就用「不记录」兜底 ——
 /// 日志是为了排查问题，绝不能反过来把程序拖垮（PRD F11 声明解析失败同理）。
@@ -34,6 +42,16 @@ pub fn init() {
     line("INFO", "=== PowerRing 启动 ===".to_string());
 }
 
+/// 上一次滚动失败还在一分钟之内，就先别试了（见 ROTATE_BACKOFF）
+fn rotate_backing_off() -> bool {
+    ROTATE_FAILED_AT
+        .lock()
+        .ok()
+        .and_then(|t| *t)
+        .map(|t| t.elapsed() < ROTATE_BACKOFF)
+        .unwrap_or(false)
+}
+
 pub fn line(level: &str, msg: String) {
     let mut g = match WRITER.lock() {
         Ok(g) => g,
@@ -45,12 +63,24 @@ pub fn line(level: &str, msg: String) {
         .and_then(|f| f.metadata().ok())
         .map(|m| m.len() >= MAX_BYTES)
         .unwrap_or(false);
-    if too_big {
+    if too_big && !rotate_backing_off() {
         *g = None; // 先关句柄，Windows 上不关就改不了名
-        let old = appdata_dir().join("log.1.txt");
-        let _ = fs::remove_file(&old);
-        let _ = fs::rename(appdata_dir().join("log.txt"), &old);
-        *g = open(&appdata_dir().join("log.txt"));
+        let dir = appdata_dir();
+        let cur = dir.join("log.txt");
+        // 顺序是刻意的：先改名到一个不冲突的临时名，成功之后才删上一份历史档。
+        // 反过来（先删旧档再改名）在改名失败时会把仅有的历史档一起赔掉，
+        // 而 log.txt 还是超限 —— 下一条日志又走一遍同样的流程，一路赔下去
+        if fs::rename(&cur, dir.join("log.rotating")).is_ok() {
+            let _ = fs::remove_file(dir.join("log.1.txt"));
+            let _ = fs::rename(dir.join("log.rotating"), dir.join("log.1.txt"));
+            if let Ok(mut t) = ROTATE_FAILED_AT.lock() {
+                *t = None;
+            }
+        } else if let Ok(mut t) = ROTATE_FAILED_AT.lock() {
+            // 记下失败时刻，一分钟内不再折腾
+            *t = Some(Instant::now());
+        }
+        *g = open(&cur);
     }
     if let Some(f) = g.as_mut() {
         // 每条都 flush：日志频率很低，但崩溃时最后几行最值钱，不能不落盘

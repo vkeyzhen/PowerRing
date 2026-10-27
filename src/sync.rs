@@ -51,6 +51,10 @@ pub struct Outcome {
     pub added: usize,
     /// 内容发生了变化的份数
     pub updated: usize,
+    /// 拉到了、也解析了，但没能写进本机磁盘的份数。
+    /// 单独留一格是为了让界面能说实话：全失败时 added/updated 都是 0，
+    /// 若没有这一格，「一份都没写进去」和「全都已经是最新」长得一模一样
+    pub failed: usize,
     /// 最终用哪个地址拉到的。日志和提示里都要说清，否则排查时无从下手
     pub source: String,
 }
@@ -67,8 +71,8 @@ pub fn run(custom: Option<&str>) -> Result<Outcome, String> {
         match fetch(&url).and_then(|body| apply(&body, &url)) {
             Ok(out) => {
                 info!(
-                    "[sync] 成功：{url} 共 {} 份，新增 {} 更新 {}",
-                    out.total, out.added, out.updated
+                    "[sync] 成功：{url} 共 {} 份，新增 {} 更新 {} 写不进 {}",
+                    out.total, out.added, out.updated, out.failed
                 );
                 return Ok(out);
             }
@@ -101,11 +105,12 @@ fn sources(custom: Option<&str>) -> Vec<String> {
 fn apply(body: &str, source: &str) -> Result<Outcome, String> {
     let list = crate::profile::parse_bundle(body)?;
     let total = list.len();
-    let (added, updated) = crate::profile::save_synced(&list);
+    let (added, updated, failed) = crate::profile::save_synced(&list);
     Ok(Outcome {
         total,
         added,
         updated,
+        failed,
         source: source.to_string(),
     })
 }

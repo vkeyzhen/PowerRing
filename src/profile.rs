@@ -403,9 +403,26 @@ fn same_target(a: &Profile, b: &Profile) -> bool {
     a.vid == b.vid
         && a.pid == b.pid
         && a.protocol == b.protocol
-        && a.usage_page == b.usage_page
-        && a.usage == b.usage
+        && usage_compatible(a.usage_page, b.usage_page)
+        && usage_compatible(a.usage, b.usage)
         && a.battery_feature == b.battery_feature
+}
+
+/// 两个接口定位是不是同一处。
+///
+/// **任一方没写就算同一个**，而不是要求严格相等：老声明里常常没写
+/// `usage_page/usage`（省略时会匹配该 VID/PID 的所有接口），而远程修正版可能补上了。
+/// 严格相等会把「同一条声明的修正版」判成另一台设备，两份都进列表 ——
+/// 后果是面板上同一台鼠标出现两行。
+///
+/// 刻意**不**把 `identify.contains` 纳入比较：它决定的是「这个 slot 上是不是这台」，
+/// 不是「这条声明在说哪台设备」。拿它参与去重，会让「给老声明补一个识别关键字」
+/// 这种修正被判成新设备，正好抵消掉同步功能存在的意义。
+fn usage_compatible(a: Option<u16>, b: Option<u16>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
 }
 
 /// 解析远程聚合清单：一个文件里装着多份声明。
@@ -499,20 +516,46 @@ fn slug(p: &Profile) -> String {
 /// - 本次清单里没有的 synced-* 一律删掉。远程撤掉一份错声明，
 ///   本地还留着就是继续用错的
 ///
-/// 返回（新增的份数，更新的份数）
-pub fn save_synced(list: &[Profile]) -> (usize, usize) {
+/// 返回（新增的份数，更新的份数，没写成功的份数）
+///
+/// 第三个值不能省：目录建不出来、磁盘满、`%APPDATA%` 只读时，前两个都是 0，
+/// 而「全都已经是最新」也是 0 —— 界面若只看前两个，就会在「一份都没写进去」时
+/// 报「已经是最新了」，用户重启后发现设备还是缺的，却不知道该怀疑什么。
+pub fn save_synced(list: &[Profile]) -> (usize, usize, usize) {
     let Some(dir) = user_devices_dir() else {
-        return (0, 0);
+        warn!("[profile] 找不到用户声明目录（APPDATA 为空？）");
+        return (0, 0, list.len());
     };
     if let Err(e) = fs::create_dir_all(&dir) {
         warn!("[profile] 建不了用户声明目录 {:?}：{e}", dir);
-        return (0, 0);
+        return (0, 0, list.len());
     }
     let mut added = 0;
     let mut updated = 0;
+    let mut failed = 0;
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in list {
-        let file = format!("synced-{}.yaml", slug(p));
+        // 两份不同的声明可能算出同一个文件名：slug 只看 VID/PID/feature，而同一台设备
+        // 可能有两种寻址接口、两套报文。以前后写的会静默覆盖先写的，界面上还报
+        // 「新增 1 更新 1」，磁盘上却只剩一个文件 —— 重启后少一台，日志里看不出是谁。
+        // 撞名就加序号，两份都留下
+        let stem = slug(p);
+        let mut file = format!("synced-{stem}.yaml");
+        let mut n = 1;
+        while used.contains(&file) {
+            n += 1;
+            if n > 9 {
+                break;
+            }
+            file = format!("synced-{stem}-{n}.yaml");
+        }
+        if n > 9 {
+            warn!("[profile] 文件名反复撞名，跳过这一份：{}", p.name);
+            failed += 1;
+            continue;
+        }
+        used.insert(file.clone());
         keep.insert(file.clone());
         let path = dir.join(&file);
         let text = to_yaml(p, NOTE_SYNCED);
@@ -535,7 +578,10 @@ pub fn save_synced(list: &[Profile]) -> (usize, usize) {
                 }
                 info!("[profile] 同步声明 {file}");
             }
-            Err(e) => warn!("[profile] 写不进 {:?}：{e}", path),
+            Err(e) => {
+                warn!("[profile] 写不进 {:?}：{e}", path);
+                failed += 1;
+            }
         }
     }
     // 清理：本次清单里没有的 synced-* 全部删掉
@@ -550,7 +596,7 @@ pub fn save_synced(list: &[Profile]) -> (usize, usize) {
             }
         }
     }
-    (added, updated)
+    (added, updated, failed)
 }
 
 /// 用户目录：%APPDATA%\PowerRing\devices
@@ -630,8 +676,12 @@ fn to_yaml(p: &Profile, note: &str) -> String {
     if let Some(u) = p.usage {
         s.push_str(&format!("  usage: \"0x{u:04X}\"\n"));
     }
-    // 只有「经接收器」才需要 slot 列表；直连那份写了也会被解析端忽略
-    if p.protocol == Protocol::Hidpp20 && p.transport == Transport::Receiver {
+    // 只有「经接收器」才需要 slot 列表；直连那份写了也会被解析端忽略。
+    // 这里的判据只看 transport，不看协议 —— raw 协议同样可以经接收器寻址
+    // （compile 那边是允许 raw + receiver 的）。以前多写了 `protocol == Hidpp20`
+    // 这个条件，于是 raw+receiver 的声明写出去就丢了 slots 整行，读回来变成默认 1..6，
+    // 往返悄悄改了值，而仓库里那 4 份内置声明里没有这种组合，测试也就测不到
+    if p.transport == Transport::Receiver {
         let slots = p
             .slots
             .iter()
@@ -704,13 +754,21 @@ fn hex_str(bytes: &[u8]) -> String {
 /// YAML 双引号字符串：引号、反斜杠和控制字符都得处理，
 /// 否则设备名里一个引号就能让整份声明解析失败 —— 而声明解析失败是静默跳过的，
 /// 用户只会看到「这台设备没了」，很难联想到是自己名字里的引号惹的祸。
+///
+/// 换行和制表符走**转义**而不是替换成空格：有些说明字段本来就是多行写的
+/// （`protocol_source` 里贴一段来源说明很常见），换成空格等于悄悄改了内容，
+/// 同步落盘再读出来就和远程那份不一样了。双引号里的 `\n` 是合法转义，读回来是原字符。
 fn yaml_string(s: &str) -> String {
     let esc: String = s
         .chars()
         .map(|c| match c {
             '"' => "\\\"".to_string(),
             '\\' => "\\\\".to_string(),
-            '\n' | '\r' | '\t' => ' '.to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            // 其余控制字符 YAML 双引号里也能写成 \xNN，但这些字符在设备声明里
+            // 没有任何意义，删掉比转义更干净 —— 与换行不同，删了不影响可读性
             c if c.is_control() => String::new(),
             c => c.to_string(),
         })
@@ -951,6 +1009,44 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 4, "只验了 {checked} 份，devices 目录不对？");
+    }
+
+    #[test]
+    fn raw_经接收器与多行说明都能往返() {
+        // 两种以前会静默改值的写法，仓库里那 4 份内置声明都没有，所以以前测不到：
+        // ① raw + receiver + 自定义 slots —— to_yaml 曾按 `protocol == Hidpp20` 判断，
+        //    raw 的 slots 整行不写，读回来变成默认 1..6
+        // ② 说明字段里带换行 —— 曾被替换成空格，一段多行来源说明被压成一行
+        let text = "name: \"某耳机\"\
+            \nprotocol: \"raw\"\
+            \ntransport: \"receiver\"\
+            \nmatch:\
+            \n  vendor_id: \"0x0951\"\
+            \n  product_id: \"0x1723\"\
+            \nslots: [2, 3]\
+            \nbattery:\
+            \n  request: \"21 FF 05\"\
+            \n  reply_len: 20\
+            \n  state_index: 3\
+            \n  value_index: 4\
+            \nprotocol_source: \"第一行\\n第二行\"\
+            \nverification: \"inferred\"\n";
+        let orig = serde_yml::from_str::<Raw>(text)
+            .expect("解析不了")
+            .compile()
+            .expect("编译不了");
+        assert_eq!(orig.slots, vec![2, 3], "解析阶段就该保留 slots");
+
+        let written = to_yaml(&orig, "");
+        assert!(
+            written.contains("slots: [2, 3]"),
+            "写出去丢了 slots：\n{written}"
+        );
+        let back = serde_yml::from_str::<Raw>(&written)
+            .expect("写出去的解析不了")
+            .compile()
+            .expect("写出去的编译不了");
+        assert_eq!(orig, back, "往返之后字段变了：\n{written}");
     }
 
     /// `identify.contains` 是「读到名字要含这串才算命中」，丢了会把同一接收器上的

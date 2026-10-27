@@ -138,6 +138,12 @@ unsafe fn pump_messages() {
 
     let mut msg: MSG = std::mem::zeroed();
     while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+        // 设置窗口是自建的顶层窗口，不是对话框：Tab 换焦点、Enter 保存、Esc 关闭
+        // 这些「对话框肌肉记忆」得靠对话框管理器补上，否则一组 WS_TABSTOP 控件
+        // 只能用鼠标点，Esc 更是按了没反应。返回 true 表示消息已被处理完
+        if settings::handle_dialog_keys(&msg) {
+            continue;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -487,6 +493,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// 到点自动恢复常规节奏：设备真的一晚上不开，也不该整夜每 10 秒扫一遍总线。
         const RETURN_WINDOW: Duration = Duration::from_secs(180);
         const RETURN_WAIT: u64 = 10;
+        /// 空列表最多连续走几轮 5 秒短周期。
+        ///
+        /// 4 轮 ≈ 20 秒，覆盖得住「开机时接收器几十秒不响应」里最坏的那一段
+        /// （每轮本身还要花时间在扫描上，实际墙钟更长）。之后退回正常周期：
+        /// 一台设备都没有往往意味着本机就没有受支持的设备，这时候每 5 秒
+        /// 枚举一遍总线、打开一遍 GATT、再发一遍探测报文，纯粹是白烧电 ——
+        /// 而探测会把睡着的设备叫醒，等于替它耗电
+        const EMPTY_SCAN_LIMIT: u32 = 4;
         /// 隔多久重新扫一遍总线。无线设备随时可能开机，
         /// 只在「一台都没扫到」时重扫是不够的 —— 已经有一台时，后开机的那台永远进不来
         const RESCAN_EVERY: Duration = Duration::from_secs(60);
@@ -643,6 +657,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_scan = Instant::now();
         // 刚有设备消失时置为中短期的截止时刻，在这之前都当它「随时会回来」
         let mut return_until: Option<Instant> = None;
+        // 连着多少轮一台设备都没有。
+        //
+        // 空列表要走 5 秒短周期重试（开机时接收器常有几十秒不响应），但**不能永远**：
+        // 那个短周期每轮都会刷新总线枚举、对每台蓝牙设备打开 GATT、
+        // 甚至重新发探测报文。本机就是没有受支持的设备时，这就成了拿全量扫描当心跳 ——
+        // 白耗电，而且探测会叫醒睡着的设备。连续几轮都空就退回正常周期
+        let mut empty_scans: u32 = 0;
 
         loop {
             let awaiting = return_until.map(|t| Instant::now() < t).unwrap_or(false);
@@ -847,12 +868,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 算进去的话轮询会永久卡在 5 秒一輪，白费力气
             let still_pending =
                 watched.is_empty() || watched.iter().any(|w| w.percent.is_none() && !w.offline);
+            // 空列表的短周期只连续用几轮：见 empty_scans 的说明。
+            // 一旦检出设备就清零，下次真的空下来仍然享受那几轮快速重试
+            if watched.is_empty() {
+                empty_scans = empty_scans.saturating_add(1);
+            } else {
+                empty_scans = 0;
+            }
             // 有设备刚读失败、还在等第二次确认：别等满一个周期，否则关机后
             // 两次确认之间又要白等 30 秒，用户会以为程序没反应
             let confirming = watched.iter().any(|w| w.misses > 0);
             // 刚有设备消失：多为「先关机，过会儿再开」，这段时间把节奏压密，
             // 让它重新出现在十几秒的量级，而不是等 60 秒的重扫周期
-            let wait: u64 = if still_pending || removed {
+            let wait: u64 = if watched.is_empty() && empty_scans > EMPTY_SCAN_LIMIT {
+                // 连着几轮都一台没有：本机大概就没有受支持的设备，
+                // 退回正常周期，别再拿全量扫描当心跳
+                settings::interval() as u64
+            } else if still_pending || removed {
                 REMOVED_RECHECK
             } else if confirming {
                 CONFIRM_WAIT
@@ -1185,14 +1217,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SYNC_BUSY.store(false, Ordering::SeqCst);
             let (lines, changed) = match out {
                 Ok(o) => {
-                    let head = if o.added > 0 {
+                    let wrote = o.added + o.updated;
+                    // 写盘失败要单独说：全失败时 added/updated 都是 0，
+                    // 若只按那两个值生成文案，会对着「一份都没写进去」说「已经是最新了」
+                    let head = if o.failed > 0 && wrote == 0 {
+                        format!("{} 份都没能写进本机", o.failed)
+                    } else if o.failed > 0 {
+                        format!("写入 {} 份，另有 {} 份没写进去", wrote, o.failed)
+                    } else if o.added > 0 {
                         format!("新增了 {} 份设备声明", o.added)
                     } else if o.updated > 0 {
                         format!("更新了 {} 份设备声明", o.updated)
                     } else {
                         "已经是最新了".to_string()
                     };
-                    let changed = o.added + o.updated > 0;
+                    let changed = wrote > 0;
                     if changed {
                         let _ = reload_tx.send(());
                         // 顺手把它叫醒：它平时睡一整轮，
@@ -1201,7 +1240,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let mut v = vec![Line {
                         text: head,
-                        swatch: color_of(100, false),
+                        swatch: if o.failed > 0 {
+                            theme::colors().warn
+                        } else {
+                            color_of(100, false)
+                        },
                     }];
                     if changed {
                         v.push(Line {
@@ -1271,7 +1314,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Vec<_>>()
             };
             info!("[alert] 试一次：弹出 {} 台设备", latest.len());
-            popup::alert(lines, "提醒卡片（试一次）", icon_rect(&tray));
+            // 走「强制」那条：面板开着也照弹。用户点这个按钮就是想看卡片长什么样，
+            // 被「面板已开着」挡掉的话，屏幕上什么都不变，他只会以为按钮坏了
+            popup::alert_forced(lines, "提醒卡片（试一次）", icon_rect(&tray));
         }
 
         // 低电量提醒：绝大多数轮次收到的是空数组，只有真跨档了才有内容

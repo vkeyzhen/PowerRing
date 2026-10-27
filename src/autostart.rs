@@ -123,8 +123,7 @@ pub fn is_enabled() -> bool {
     };
     match read_value() {
         Some(v) => {
-            // 允许值里带引号和启动参数，取第一段路径来比
-            let first = v.trim().trim_matches('"');
+            let first = first_arg(&v);
             let hit = first.eq_ignore_ascii_case(cur.to_string_lossy().as_ref());
             info!(
                 "[autostart] 注册表里是 {:?}，当前 exe 是 {:?}，判定为 {}",
@@ -142,6 +141,21 @@ pub fn is_enabled() -> bool {
             info!("[autostart] 注册表里没有 PowerRing，判定为未开启");
             false
         }
+    }
+}
+
+/// 从注册表值里取出第一段 —— 也就是 exe 路径。
+///
+/// 带引号（多是因为路径里有空格）就取到**配对的右引号**为止；不带引号就取到第一个空白。
+/// 以前这里只做 `trim_matches('"')`，只去掉了前引号，得到的是
+/// `C:\…\powerring.exe" --tray` —— 这样的值跟当前 exe 比必然不等，
+/// 于是「用户自己给它加了参数」会被判成「没开启」，而在设置里勾一下保存，
+/// 就会用不带参数的那行把用户原来的覆盖掉
+fn first_arg(v: &str) -> &str {
+    let t = v.trim();
+    match t.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => t.split_whitespace().next().unwrap_or(""),
     }
 }
 
@@ -185,5 +199,32 @@ pub fn repair(expected: bool) {
         if let Err(e) = set(true) {
             warn!("[autostart] 补写失败：{}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_arg;
+
+    #[test]
+    fn 自启值只取第一段路径() {
+        // 带引号 + 参数：路径里有空格时系统就是这么写
+        assert_eq!(
+            first_arg("\"C:\\Tools\\Power Ring\\powerring.exe\" --tray"),
+            "C:\\Tools\\Power Ring\\powerring.exe"
+        );
+        // 不带引号 + 参数
+        assert_eq!(
+            first_arg("C:\\a\\powerring.exe --min"),
+            "C:\\a\\powerring.exe"
+        );
+        // 就一个路径，前后有空白
+        assert_eq!(
+            first_arg("  C:\\a\\powerring.exe  "),
+            "C:\\a\\powerring.exe"
+        );
+        // 退化输入不能 panic
+        assert_eq!(first_arg("\""), "");
+        assert_eq!(first_arg(""), "");
     }
 }

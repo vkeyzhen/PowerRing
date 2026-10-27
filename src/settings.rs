@@ -13,6 +13,7 @@ use crate::info;
 use crate::theme::{self, Colors};
 use crate::ui::{create_font, font_px as ui_font_px, px, rgb};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+use std::sync::Mutex;
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -23,11 +24,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, GetClientRect, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, RegisterClassW, SendMessageW, SetWindowPos,
-    SetWindowTextW, ShowWindow, HMENU, HWND_TOP, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_SETFONT, WM_SETTINGCHANGE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, IsChild, IsDialogMessageW, IsWindowVisible,
+    RegisterClassW, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, HMENU, HWND_TOP, MSG,
+    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_SETFONT, WM_SETTINGCHANGE,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 // 按钮和复选框都改成自绘（BS_OWNERDRAW）。
@@ -81,6 +82,13 @@ const ID_TEST: isize = 1040;
 const ID_AUTO: isize = 1050;
 const ID_THEME: isize = 1060;
 const ID_SYNC_URL: isize = 1070;
+/// 对话框管理器（`IsDialogMessageW`）转发过来的两个固定 ID：Enter → IDOK、
+/// Tab 到带默认按钮时也一样。它们和上面那套自定的控件 ID 不是一回事，得单独认
+const ID_DLG_OK: isize = 1;
+const ID_DLG_CANCEL: isize = 2;
+/// Esc 的虚拟键码。同样的道理：为一两个数去开 `Win32_UI_Input_KeyboardAndMouse`
+/// 那套 feature 不值（本项目一贯的做法，见 ui.rs 里那几个 SM_* 常量）
+const VK_ESCAPE: u32 = 0x1B;
 
 // 96 DPI 下的**客户区**布局，实际按 DPI 放大。
 // 注意这是客户区（放控件的那块），不是窗口外框 —— 外框还要再加标题栏和边框，
@@ -129,6 +137,12 @@ static HW_AUTO: AtomicIsize = AtomicIsize::new(0);
 static NOTIFY_CHECK: AtomicBool = AtomicBool::new(true);
 static AUTO_CHECK: AtomicBool = AtomicBool::new(false);
 static HW_THEME: AtomicIsize = AtomicIsize::new(0);
+/// 打开窗口那一刻，配置里记着的主题。
+///
+/// 主题是唯一「点了就立刻落到运行时、但不经过保存」的项。点两下看了看效果再点取消，
+/// 界面已经变了而配置没变，重启后又自己变回去 —— 用户会以为「设置没存住」。
+/// 所以关窗时按这个值退回去。保存路径不走关窗逻辑，正常保存不受影响
+static THEME_ON_OPEN: Mutex<Option<theme::Mode>> = Mutex::new(None);
 static HW_SYNC_URL: AtomicIsize = AtomicIsize::new(0);
 /// 「检查设备声明更新…」用的地址。留空表示用程序内置的那两个。
 /// 用锁而不是 Atomic 是因为它是个字符串；用 String 而不是 &'static str
@@ -497,6 +511,10 @@ pub fn create() -> Result<(), windows::core::Error> {
 /// 打开窗口并填入当前配置
 pub fn open() {
     let cfg = Config::load();
+    // 记下此刻**配置里**的主题（不是运行时那个），关窗时用它回滚
+    if let Ok(mut g) = THEME_ON_OPEN.lock() {
+        *g = Some(theme::Mode::from_str(&cfg.theme));
+    }
     unsafe {
         set_text(ctl(&HW_INTERVAL), &cfg.poll_interval_secs.to_string());
         set_text(ctl(&HW_WARN), &cfg.low_warn.to_string());
@@ -543,9 +561,45 @@ pub fn open() {
 }
 
 fn hide() {
+    // 主题是唯一「点了就落到运行时、但没保存」的项：点两下看了看再点取消，
+    // 界面样式已经变了而配置没变，重启后又自己变回去 —— 用户会以为没存住。
+    // 关窗时退回打开那一刻配置里的值。保存路径不经过这里，正常保存不受影响
+    if let Some(was) = THEME_ON_OPEN.lock().ok().and_then(|g| *g) {
+        if theme::current_mode() != was {
+            theme::set_mode(was);
+            // 卡片可能正挂在屏幕上，不重绘就会一半深一半浅
+            crate::popup::repaint();
+        }
+    }
     unsafe {
         let _ = ShowWindow(hwnd(), SW_HIDE);
     }
+}
+
+/// 在消息泵里替设置窗口补上「对话框的肌肉记忆」：Esc 关闭、Tab 换焦点、Enter 保存。
+///
+/// 这是一张自建的顶层窗口，不是对话框，而里面的控件全带着 `WS_TABSTOP`。没有对话框
+/// 管理器的话，Tab 不会移动焦点、Enter 什么都不触发、Esc 按了没反应 —— 一组控件
+/// 只能用鼠标点，习惯用键盘的人连「保存」都够不着。
+///
+/// Esc 由这里自己判，不交给 `IsDialogMessageW`：那个函数只在窗口上真有 Cancel 按钮时
+/// 才把 Esc 翻成 `IDCANCEL`，而我们的按钮 ID 是自己定的，对不上。
+/// 而且只在焦点落在这张窗口（或它的子控件）上时才吃，不该吞掉别处的 Esc。
+pub fn handle_dialog_keys(msg: &MSG) -> bool {
+    let h = hwnd();
+    if h.0.is_null() || !unsafe { IsWindowVisible(h).as_bool() } {
+        return false;
+    }
+    if msg.message == WM_KEYDOWN
+        && msg.wParam.0 as u32 == VK_ESCAPE
+        && (msg.hwnd == h || unsafe { IsChild(h, msg.hwnd) }.as_bool())
+    {
+        hide();
+        return true;
+    }
+    // 剩下的交给系统的对话框管理器：Tab / Shift+Tab、Enter 转成 IDOK、
+    // 方向键在同类控件间移动。它只处理自己认识的消息，其余的返回 FALSE 由我们继续派发
+    unsafe { IsDialogMessageW(h, msg).as_bool() }
 }
 
 /// 保存：三样都校验，不合法就地提示，绝不让脏值写进配置
@@ -894,6 +948,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             match id {
                 ID_SAVE => on_save(),
                 ID_CANCEL => hide(),
+                // Enter 保存、Esc 关闭：来自 handle_dialog_keys 那条路
+                ID_DLG_OK => on_save(),
+                ID_DLG_CANCEL => hide(),
                 // 真正的弹卡片动作得留给主线程（窗口和消息泵同线程），
                 // 这里只把「有人点了」这个事实递过去
                 ID_TEST => TEST_REQUESTED.store(true, Ordering::SeqCst),

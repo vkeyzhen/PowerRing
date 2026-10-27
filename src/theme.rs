@@ -85,6 +85,9 @@ pub struct Colors {
     /// 托盘电量环的未填充部分，以及「未知」时的整环
     pub ring_empty: (u8, u8, u8),
     pub ring_unknown: (u8, u8, u8),
+    /// 提示里的「有事但不算失败」那一档：同步时部分声明没写进磁盘、
+    /// 拉不到更新一类的提示点。与电量环的警告色同源，用户不用重新学一套语义
+    pub warn: (u8, u8, u8),
 }
 
 const LIGHT: Colors = Colors {
@@ -99,6 +102,7 @@ const LIGHT: Colors = Colors {
     edit_bg: (255, 255, 255),
     ring_empty: (75, 75, 75),
     ring_unknown: (110, 110, 110),
+    warn: (200, 105, 20),
 };
 
 // 深色不是把浅色反转：卡片用 #2D2D30（VS / Win10 深色面板的常见底色），
@@ -116,6 +120,8 @@ const DARK: Colors = Colors {
     // 环要在深色任务栏上看得见，未填充部分得比浅色主题时浅一档
     ring_empty: (112, 112, 118),
     ring_unknown: (160, 160, 168),
+    // 深底上要亮一档，否则这行橙色提示在卡片里几乎读不出来
+    warn: (240, 160, 70),
 };
 
 // 存 u8 而不是 Mode：静态变量要在编译期初始化，Mode 是枚举也行，

@@ -242,6 +242,13 @@ pub fn find(api: &HidApi, declared: &[Profile]) -> Vec<Profile> {
         // 先分清它是接收器还是直连设备，再决定怎么问 —— 顺序反了会在接收器上
         // 只认住 index 1，设备漂到别的 slot 就再也读不到
         let fallback = hid_name(info);
+        // 实际应答的这个接口；下面两种模式都会把它写进声明
+        let at = Found {
+            vid,
+            pid,
+            usage_page: info.usage_page(),
+            usage: info.usage(),
+        };
 
         if looks_direct(&conn) {
             if let Some((feat, kind)) = try_direct(&conn) {
@@ -253,8 +260,7 @@ pub fn find(api: &HidApi, declared: &[Profile]) -> Vec<Profile> {
                 seen.push((vid, pid));
                 out.push(hidpp_profile(
                     name,
-                    vid,
-                    pid,
+                    &at,
                     feat,
                     kind,
                     Transport::Direct,
@@ -279,8 +285,7 @@ pub fn find(api: &HidApi, declared: &[Profile]) -> Vec<Profile> {
             );
             out.push(hidpp_profile(
                 name,
-                vid,
-                pid,
+                &at,
                 feat,
                 kind,
                 Transport::Receiver,
@@ -307,15 +312,27 @@ fn hid_name(info: &hidapi::DeviceInfo) -> String {
     }
 }
 
-fn hidpp_profile(
-    name: String,
+/// 发现到的一台设备定位：VID/PID 加上**实际应答的那个接口**。
+///
+/// 接口这一层不能省：写进声明之后，扫描只打开这一个接口。
+/// 不写的话声明会匹配该 VID/PID 的所有接口，之后每轮都会对着那些不答话的接口
+/// 把每个 slot 问一遍，白等一串超时
+struct Found {
     vid: u16,
     pid: u16,
+    usage_page: u16,
+    usage: u16,
+}
+
+fn hidpp_profile(
+    name: String,
+    at: &Found,
     feature: u16,
     kind: BatteryKind,
     transport: Transport,
     slots: Vec<u8>,
 ) -> Profile {
+    let (vid, pid) = (at.vid, at.pid);
     Profile {
         name,
         short_name: None,
@@ -323,8 +340,8 @@ fn hidpp_profile(
         transport,
         vid,
         pid,
-        usage_page: None,
-        usage: None,
+        usage_page: Some(at.usage_page),
+        usage: Some(at.usage),
         battery_feature: Some(feature),
         battery_kind: kind,
         raw: None,
