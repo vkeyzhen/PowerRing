@@ -39,7 +39,11 @@ pub enum Transport {
 }
 
 /// 编译后的声明：十六进制已解析成数值，可直接参与比较
-#[derive(Debug, Clone)]
+///
+/// 派生 `PartialEq` 只为单测服务：`to_yaml` 必须做到「写出去再读回来一模一样」，
+/// 判等交给编译器生成，比手写一串逐字段断言可靠 —— 以后加了字段，漏写进
+/// `to_yaml` 会当场红，而不是等用户重启后发现那台设备认不出来了
+#[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     pub name: String,
     /// 托盘悬停文字用的短名。同时挂好几台设备时全名拼起来会很长，
@@ -170,7 +174,7 @@ struct RawIdentify {
 }
 
 /// protocol: raw 的报文规格。字段全部来自声明，代码里不出现任何厂商常量
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawSpec {
     /// 请求报文（首字节是 report id），会补 0 到 reply_len 的长度
     pub request: Vec<u8>,
@@ -293,7 +297,7 @@ impl Raw {
 /// 只认一边，另一边必然失效，表现是「托盘起来了但一台设备都扫不到」。
 /// 所以按 exe 所在目录往上找，找不着再退回工作目录。
 pub fn load() -> Vec<Profile> {
-    let mut all = Vec::new();
+    let mut all: Vec<Loaded> = Vec::new();
     let mut any_dir = false;
     for base in candidate_bases() {
         let d = base.join("devices");
@@ -307,24 +311,78 @@ pub fn load() -> Vec<Profile> {
         warn!("[profile] 没找到 devices 目录，程序将检测不到任何设备");
         return Vec::new();
     }
-    // 同一个设备可能被两个目录同时声明：内置名单里有的，后来自动发现又写了一份到用户目录。
-    // 以**先加载到的为准**（exe 旁的在前，也就是内置优先），后到的整份跳过 ——
-    // 留两份会让同一台设备在面板里出现两行。
-    let mut out: Vec<Profile> = Vec::new();
-    for p in all {
-        let dup = out
-            .iter()
-            .any(|q| q.vid == p.vid && q.pid == p.pid && q.protocol == p.protocol);
-        if dup {
-            info!(
-                "[profile] {} 已在前面的目录里声明过，跳过重复的一份",
-                p.name
-            );
-            continue;
-        }
-        out.push(p);
+    merge(all)
+}
+
+/// 装载进来的一份声明，连同「它有多可信」。
+struct Loaded {
+    p: Profile,
+    /// 可信度分层，数字越小越优先。取值见 `rank_of`
+    rank: u8,
+    /// 来自哪个文件。只在日志里用，但必须留着 ——
+    /// 出问题时用户问的是「到底用了哪一份」，没有文件名就只能让他挨个删着试
+    file: String,
+}
+
+/// 一份声明的可信度。**数字小 = 更可信**。
+///
+/// 排序依据是「谁最可能知道这台设备的真相」：
+///   0. 用户自己写的（用户目录里 non-synced / non-auto 的）—— 这台机器的主人的意志
+///   1. 远程同步来的 `synced-*` —— 维护者维护、且是最新的，所以压过内置
+///   2. 内置（exe 自带）—— 跟着版本走，可能已经旧了
+///   3. 自动发现写的 `auto-*` —— 程序自己猜的，名字和参数都可能是将就
+///
+/// **`synced-*` 必须压过内置**，否则「检查设备声明更新」这个功能对已支持的设备
+/// 完全无效：用户在磁盘上看到文件被更新了、界面报「更新了 1 份」、重启，
+/// 内存里用的却还是 exe 里那份旧的。这一条是 2026-10-27 审查揪出来的。
+fn rank_of(dir: &Path, name: &str) -> u8 {
+    if user_devices_dir().as_deref() != Some(dir) {
+        return 2;
     }
-    out
+    if name.starts_with("synced-") {
+        1
+    } else if name.starts_with("auto-") {
+        3
+    } else {
+        0
+    }
+}
+
+/// 把多个目录、多个来源的声明合并成一份不重复的列表。
+///
+/// 拆分出来是为了能离线单测：真实目录结构没法在测试里摆出来，
+/// 而「谁盖住谁」恰恰是那种写反了也不报错、只在用户那儿表现为「同步没反应」的逻辑。
+fn merge(mut all: Vec<Loaded>) -> Vec<Profile> {
+    // 稳定排序：同层之内保持目录遍历顺序，行为可预期
+    all.sort_by_key(|l| l.rank);
+    let mut out: Vec<(Profile, String)> = Vec::new();
+    for l in all {
+        match out.iter().position(|(q, _)| same_target(q, &l.p)) {
+            Some(i) => info!(
+                "[profile] {} 有不止一份声明：用 {}，跳过 {}",
+                l.p.name, out[i].1, l.file
+            ),
+            None => out.push((l.p, l.file)),
+        }
+    }
+    out.into_iter().map(|(p, _)| p).collect()
+}
+
+/// 两份声明是不是在描述**同一台**设备。
+///
+/// 不能只比 VID/PID + 协议。两个真实场景会被那样的粗键误判：
+/// · 一个接收器上挂着两台（鼠标 + 键盘），VID/PID 是接收器的，完全相同
+/// · 同一型号有两种电量读法（0x1001 电压 / 0x1004 百分比），协议也相同
+/// 误判的后果是后一份整份被丢掉 —— 表现出来就是「明明声明了这台，面板里没有」。
+/// 所以把「定位到设备」的每个维度都比一遍：接口（usage_page/usage）
+/// 和电量 feature 都是区分同一外壳下不同设备的依据。
+fn same_target(a: &Profile, b: &Profile) -> bool {
+    a.vid == b.vid
+        && a.pid == b.pid
+        && a.protocol == b.protocol
+        && a.usage_page == b.usage_page
+        && a.usage == b.usage
+        && a.battery_feature == b.battery_feature
 }
 
 /// 解析远程聚合清单：一个文件里装着多份声明。
@@ -482,6 +540,16 @@ const NOTE_SYNCED: &str = "\
 /// 手写而不走 serde 是有意的：文件里要带上「这是怎么来的、能不能改」的说明，
 /// 序列化出来的东西没法夹带这些话，而恰恰是这些话决定了用户敢不敢动手改。
 /// `note` 就是那段说明，两种来源的说法不一样（见上面两个常量）。
+///
+/// **必须做到「写出去再读回来一模一样」**。这不只是整洁问题 ——
+/// 远程同步下来的声明就是先 `to_yaml` 落到磁盘、下次启动再由 `load_from` 读回来的。
+/// 少写一个字段，那份声明落盘即残废：文件还在、看起来没问题，程序却认不出那台设备，
+/// 排查时会往网络、往设备上找，很难想到是这一层丢的。
+///
+/// 2026-10-27 修过一次：原版只写 9 个字段，raw 协议的 `request` / `reply_len` /
+/// `state_index` / `value_index` / `charging_states` / `table` 全丢，
+/// 于是「同步一台新的 raw 设备」这条路根本不通 —— 写下去的就是一份读不出来的残文件。
+/// 现在由单测 `raw声明写出去再读回来不丢字段` 守着：以后加字段忘了写进这里，立刻红。
 fn to_yaml(p: &Profile, note: &str) -> String {
     let name = yaml_string(&p.name);
     let protocol = match p.protocol {
@@ -501,12 +569,24 @@ fn to_yaml(p: &Profile, note: &str) -> String {
     s.push_str(note);
     s.push('\n');
     s.push_str(&format!("name: {name}\n"));
+    if let Some(short) = &p.short_name {
+        s.push_str(&format!("short: {}\n", yaml_string(short)));
+    }
     s.push_str(&format!("protocol: {protocol}\n"));
     s.push_str(&format!("transport: {transport}\n"));
     s.push_str("match:\n");
     s.push_str(&format!("  vendor_id: \"0x{:04X}\"\n", p.vid));
     s.push_str(&format!("  product_id: \"0x{:04X}\"\n", p.pid));
-    if p.protocol == Protocol::Hidpp20 {
+    // usage 定的是「往哪个接口发包」，漏了它设备可能根本收不到 ——
+    // 罗技接收器三个厂商接口里只有一个认 HID++，挑错了就是一路没回应
+    if let Some(up) = p.usage_page {
+        s.push_str(&format!("  usage_page: \"0x{up:04X}\"\n"));
+    }
+    if let Some(u) = p.usage {
+        s.push_str(&format!("  usage: \"0x{u:04X}\"\n"));
+    }
+    // 只有「经接收器」才需要 slot 列表；直连那份写了也会被解析端忽略
+    if p.protocol == Protocol::Hidpp20 && p.transport == Transport::Receiver {
         let slots = p
             .slots
             .iter()
@@ -519,6 +599,31 @@ fn to_yaml(p: &Profile, note: &str) -> String {
     if let Some(f) = p.battery_feature {
         s.push_str(&format!("  feature: \"0x{f:04X}\"\n"));
     }
+    if let Some(raw) = &p.raw {
+        s.push_str(&format!("  request: \"{}\"\n", hex_str(&raw.request)));
+        s.push_str(&format!("  reply_len: {}\n", raw.reply_len));
+        s.push_str(&format!("  state_index: {}\n", raw.state_index));
+        s.push_str(&format!("  value_index: {}\n", raw.value_index));
+        let charging = raw
+            .charging_states
+            .iter()
+            .map(|b| format!("\"0x{b:02X}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!("  charging_states: [{charging}]\n"));
+        if !raw.table.is_empty() {
+            s.push_str("  table:\n");
+            // 编译时已按档位排过序，写出去也保持这个顺序：
+            // 每次同步生成的文件才会是同一份字节，而不是顺序随机跳。
+            // （sync 那边靠「内容没变就不写」省磁盘写入，字节不稳会让它每次都写）
+            for (state, rows) in &raw.table {
+                s.push_str(&format!("    \"0x{state:02X}\":\n"));
+                for (upper, percent) in rows {
+                    s.push_str(&format!("      - [{upper}, {percent}]\n"));
+                }
+            }
+        }
+    }
     s.push_str(&format!("  kind: {kind}\n"));
     // 这两个字段的值已经是「带引号的字符串」，别再套一层引号 ——
     // 套两层会让 YAML 解析出一个以引号开头的怪值，而且解析失败是静默跳过的，
@@ -528,11 +633,27 @@ fn to_yaml(p: &Profile, note: &str) -> String {
         yaml_string(&p.protocol_source)
     ));
     s.push_str(&format!("verification: {}\n", yaml_string(&p.verification)));
-    if let Some(nf) = p.name_feature {
+    if p.name_feature.is_some() || p.identify_contains.is_some() {
         s.push_str("identify:\n");
-        s.push_str(&format!("  name_feature: \"0x{nf:04X}\"\n"));
+        if let Some(nf) = p.name_feature {
+            s.push_str(&format!("  name_feature: \"0x{nf:04X}\"\n"));
+        }
+        // `contains` 是「读到名字必须包含这串才算命中」。丢了它，
+        // 同一个接收器上的其它设备就会被误认成这一台
+        if let Some(c) = &p.identify_contains {
+            s.push_str(&format!("  contains: {}\n", yaml_string(c)));
+        }
     }
     s
+}
+
+/// 字节序列 → `"21 FF 05"`（`hex_bytes` 的逆操作）
+fn hex_str(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// YAML 双引号字符串：引号、反斜杠和控制字符都得处理，
@@ -587,7 +708,7 @@ fn candidate_bases() -> Vec<PathBuf> {
     out
 }
 
-fn load_from(dir: &Path) -> Vec<Profile> {
+fn load_from(dir: &Path) -> Vec<Loaded> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else {
         warn!("[profile] 设备声明目录不可用：{:?}", dir);
@@ -606,9 +727,14 @@ fn load_from(dir: &Path) -> Vec<Profile> {
                 continue;
             }
         };
+        let name = e.file_name().to_string_lossy().to_string();
         match serde_yml::from_str::<Raw>(&text) {
             Ok(raw) => match raw.compile() {
-                Ok(prof) => out.push(prof),
+                Ok(prof) => out.push(Loaded {
+                    rank: rank_of(dir, &name),
+                    file: p.display().to_string(),
+                    p: prof,
+                }),
                 Err(err) => warn!("[profile] 声明有误，跳过 {:?}：{err}", p),
             },
             Err(err) => warn!("[profile] YAML 解析失败，跳过 {:?}：{err}", p),
@@ -632,6 +758,98 @@ mod tests {
         )
     }
 
+    /// 造一份最小可用的声明，只用来测「合并时谁盖住谁」
+    fn stub(name: &str, feature: u16) -> Profile {
+        Profile {
+            name: name.to_string(),
+            short_name: None,
+            protocol: Protocol::Hidpp20,
+            transport: Transport::Receiver,
+            vid: 0x046D,
+            pid: 0xC539,
+            usage_page: Some(0xFF00),
+            usage: Some(0x0002),
+            battery_feature: Some(feature),
+            battery_kind: BatteryKind::Voltage,
+            raw: None,
+            slots: (1..=6).collect(),
+            name_feature: None,
+            identify_contains: None,
+            protocol_source: "测试".into(),
+            verification: "测试".into(),
+        }
+    }
+
+    fn at(p: Profile, rank: u8, file: &str) -> Loaded {
+        Loaded {
+            p,
+            rank,
+            file: file.to_string(),
+        }
+    }
+
+    /// 这条是整个声明同步功能的地基。
+    ///
+    /// 如果内置那份永远赢，那么「检查设备声明更新」对**已支持**的设备就完全无效：
+    /// 文件被覆盖了、界面报「更新了 1 份」、重启 —— 用的还是 exe 里那份旧的。
+    /// 写反了不会报错，只会安静地什么都不发生，用户只会觉得这功能没用。
+    #[test]
+    fn 同步来的声明盖过内置的同名设备() {
+        let list = merge(vec![
+            at(stub("内置的旧写法", 0x1001), 2, "内置/logitech_gpw.yaml"),
+            at(
+                stub("远程修正过的", 0x1001),
+                1,
+                "用户/synced-046D-C539-1001.yaml",
+            ),
+        ]);
+        assert_eq!(list.len(), 1, "同一台设备只该留一份");
+        assert_eq!(list[0].name, "远程修正过的");
+    }
+
+    #[test]
+    fn 用户手写的赢过同步下来的() {
+        let list = merge(vec![
+            at(stub("远程的", 0x1001), 1, "用户/synced-046D-C539-1001.yaml"),
+            at(stub("我自己改的", 0x1001), 0, "用户/my-gpw.yaml"),
+        ]);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "我自己改的");
+    }
+
+    /// 同一条链路上的两种电量读法（0x1001 电压 / 0x1004 百分比）必须都留下。
+    /// 旧的去重键只比 VID/PID + 协议，会把后一份整份丢掉 ——
+    /// 表现出来就是「声明明明写了，面板里却没有这台设备」。
+    #[test]
+    fn 同一个接收器上两种电量方式各留一份() {
+        let list = merge(vec![
+            at(stub("电压式", 0x1001), 2, "a.yaml"),
+            at(stub("百分比式", 0x1004), 2, "b.yaml"),
+        ]);
+        assert_eq!(list.len(), 2);
+    }
+
+    /// 分层顺序：用户手写 < 同步 < 内置 < 自动发现。
+    /// 这里比的是大小关系而不是具体数值 —— 以后插入新层只要不破坏这个顺序就不算改坏。
+    #[test]
+    fn 可信度顺序是用户手写_同步_内置_自动发现() {
+        let user = user_devices_dir().expect("测试环境应该有 APPDATA");
+        let builtin = Path::new(r"C:\nowhere\devices");
+        let r = rank_of;
+        assert!(
+            r(&user, "my-gpw.yaml") < r(&user, "synced-046D-C539-1001.yaml"),
+            "用户手写的应该压过同步来的"
+        );
+        assert!(
+            r(&user, "synced-046D-C539-1001.yaml") < r(builtin, "logitech_gpw.yaml"),
+            "同步来的应该压过内置的"
+        );
+        assert!(
+            r(builtin, "logitech_gpw.yaml") < r(&user, "auto-046D-C539-1001.yaml"),
+            "内置的应该压过自动发现猜的"
+        );
+    }
+
     /// 这条测的不是代码，是**生成脚本和解析端对不对得上**：
     /// tools/build_remote.py 改了缩进或结构，这里第一时间红，
     /// 总好过等真有人点了「检查更新」才发现拉下来解析不了
@@ -649,6 +867,80 @@ mod tests {
             assert!(!p.name.is_empty(), "有一份声明没写名字");
             assert!(!p.protocol_source.is_empty(), "{} 没写协议来源", p.name);
         }
+    }
+
+    /// 一条声明写出去、再读回来，必须**一模一样**。
+    ///
+    /// 这是 `to_yaml` 的最高验收标准，而且是拿 `devices/` 下的真文件跑的 ——
+    /// 构造数据只能验证「我想到的字段」，真文件验证的是「实际用到的每个字段」。
+    ///
+    /// 2026-10-27 的事故正是这里漏的：raw 的 `request` / `table` 全丢，
+    /// 同步下来的声明落盘即残废，而当时的测试只验证了「文件生成了、内存里份数对了」。
+    /// 遍历目录而不是写死文件名，是为了以后加设备自动纳入，不用记得回来补测试。
+    #[test]
+    fn 内置声明写出去再读回来不丢字段() {
+        let mut checked = 0;
+        for e in std::fs::read_dir("devices")
+            .expect("读不到 devices 目录")
+            .flatten()
+        {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("读不了声明文件");
+            let orig = serde_yml::from_str::<Raw>(&text)
+                .unwrap_or_else(|e| panic!("{:?} 解析不了：{e}", path))
+                .compile()
+                .unwrap_or_else(|e| panic!("{:?} 编译不了：{e}", path));
+            let written = to_yaml(&orig, "");
+            let back = serde_yml::from_str::<Raw>(&written)
+                .unwrap_or_else(|e| panic!("{:?} 写出去之后解析不了：{e}\n{written}", path))
+                .compile()
+                .unwrap_or_else(|e| panic!("{:?} 写出去之后编译不了：{e}\n{written}", path));
+            assert_eq!(
+                orig, back,
+                "{:?} 往返之后字段变了，to_yaml 有字段没写\n--- 写出来的 ---\n{written}",
+                path
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "只验了 {checked} 份，devices 目录不对？");
+    }
+
+    /// `identify.contains` 是「读到名字要含这串才算命中」，丢了会把同一接收器上的
+    /// 别的设备认成这一台。内置声明里没用到这个字段，往返测试覆盖不到，
+    /// 所以单独构造一份。
+    #[test]
+    fn 识别关键字也要往返保留() {
+        let text = "devices:\
+            \n  - name: \"带关键字的设备\"\
+            \n    protocol: \"hid++2.0\"\
+            \n    transport: \"receiver\"\
+            \n    match:\
+            \n      vendor_id: \"0x046D\"\
+            \n      product_id: \"0xC539\"\
+            \n      usage_page: \"0xFF00\"\
+            \n      usage: \"0x0002\"\
+            \n    slots: [1, 2, 3, 4, 5, 6]\
+            \n    battery:\
+            \n      feature: \"0x1001\"\
+            \n      kind: \"voltage\"\
+            \n    identify:\
+            \n      name_feature: \"0x0005\"\
+            \n      contains: \"Pro Wireless\"\
+            \n    protocol_source: \"公开常量\"\
+            \n    verification: \"verified\"\n";
+        let orig = first(text);
+        // to_yaml 产出的是单份声明，不是 `devices:` 包裹的清单，所以不能走 parse_bundle
+        let back = serde_yml::from_str::<Raw>(&to_yaml(&orig, ""))
+            .expect("写出来的解析不了")
+            .compile()
+            .expect("写出来的编译不了");
+        assert_eq!(orig, back);
+        assert_eq!(back.identify_contains.as_deref(), Some("Pro Wireless"));
+        assert_eq!(back.usage, Some(0x0002));
+        assert_eq!(back.usage_page, Some(0xFF00));
     }
 
     #[test]

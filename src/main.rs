@@ -567,6 +567,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             out
         }
+        /// 重新枚举一次总线。
+        ///
+        /// `HidApi` 只在构造时枚举一次，之后 `device_list()` 返回的**永远是构造那一刻的快照**。
+        /// 所以不刷新的话，「设备中途插上」这件事在程序眼里根本不存在 ——
+        /// 定期重扫看起来在干活，扫的却是一份过期列表，白扫。
+        /// 拔接收器那种场景反而看不出来（设备本来就在列表里），
+        /// 只有「先开程序、后插接收器」的人才会撞上，于是特别难被测试和反馈覆盖。
+        fn refresh_bus(api: &mut HidApi) {
+            // 失败了不算大问题：接下来那次扫描用的还是旧列表，
+            // 也就是退回到修复前的行为，比直接不扫要好
+            if let Err(e) = api.refresh_devices() {
+                warn!("[hid] 重新枚举设备失败：{e}");
+            }
+        }
+
         /// 试一次自动发现：把「没写进声明、但能用公开标准读到电量」的设备认出来。
         ///
         /// 认出来的会写进用户目录变成一份真声明，下次启动直接命中，不必再探测。
@@ -595,7 +610,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut profiles = profiles;
-        let api = match HidApi::new() {
+        let mut api = match HidApi::new() {
             Ok(a) => a,
             Err(e) => {
                 warn!("[hid] 初始化失败：{e}");
@@ -637,6 +652,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 一台都没有，先想想是不是压根没被任何声明覆盖：
                 // 也许是新买的设备刚插上，也许是它开机晚了一步。
                 // 再认一次（频率由 run_discover 自己把着，不会每轮都发报文）
+                // 重扫之前先把枚举刷新一遍 —— 不然「刚插上的接收器」
+                // 压根不在 device_list 里，再怎么扫都扫不到。
+                // 自动发现也一样，它也是顺着这份列表找的
+                refresh_bus(&mut api);
                 run_discover(&api, &mut profiles, &mut last_discover, false);
                 let fresh = device::scan(&api, &profiles);
                 if !fresh.is_empty() {
@@ -671,6 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 刚有设备消失时这个周期会临时压到 RETURN_WAIT —— 用户实测
                 // 「重开 ♪ 出现」要 50 秒，就是被 60 秒的周期卡住的
                 last_scan = Instant::now();
+                refresh_bus(&mut api);
                 for d in device::scan(&api, &profiles) {
                     // 按名字找，而不是「在不在列表里」：未连接的设备也在列表里，
                     // 但它手里那个句柄可能是拔掉之前那一个 —— 接收器拔了又插回来时，
