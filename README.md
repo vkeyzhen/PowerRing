@@ -286,6 +286,15 @@ cargo build --release
 | 改代码、提 PR | [CONTRIBUTING.md](CONTRIBUTING.md)：怎么跑起来、代码要求、PR 格式 |
 | 报告安全问题 | [SECURITY.md](SECURITY.md)：走 GitHub Security Advisory 私下说，别开公开 Issue |
 
+## 致谢
+
+- [@tsubasa597](https://github.com/tsubasa597)：HID++ 应答校验、0x1004 两步读、
+  读数来源标注（对应 [#7](https://github.com/vkeyzhen/PowerRing/issues/7)、
+  [#8](https://github.com/vkeyzhen/PowerRing/issues/8)、
+  [#12](https://github.com/vkeyzhen/PowerRing/issues/12)）。
+  尤其值得记一笔的是：他把「这类 bug 只能靠报文回放验证」这个说法推翻了 ——
+  把判据抽成纯函数，用合成报文就能测。这个思路现在写在 `src/hidpp.rs` 里
+
 ## 许可证红线
 
 协议常量与报文格式属于事实信息，可以移植；**禁止直接复制** Solaar / HeadsetControl / OpenRazer 等 GPL 项目的源码。每份设备声明都必须填写 `protocol_source` 注明出处；引用 GPL 项目时只允许把常量当事实抄进来，不允许引用其代码。

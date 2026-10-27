@@ -275,6 +275,17 @@ Three doors if you want more devices recognised, or want to change the code:
 | Change code, open a PR | [CONTRIBUTING.md](CONTRIBUTING.md): how to run it, code requirements, PR format |
 | Report a security problem | [SECURITY.md](SECURITY.md): use GitHub Security Advisory, not a public issue |
 
+## Credits
+
+- [@tsubasa597](https://github.com/tsubasa597): HID++ reply validation, the two-step
+  0x1004 read, and reading-source labels (issues
+  [#7](https://github.com/vkeyzhen/PowerRing/issues/7),
+  [#8](https://github.com/vkeyzhen/PowerRing/issues/8),
+  [#12](https://github.com/vkeyzhen/PowerRing/issues/12)).
+  Worth recording specifically: he disproved the claim that such bugs can only be
+  verified by replaying real traffic — extract the predicate into a pure function and
+  synthetic packets are enough. That idea now lives in `src/hidpp.rs`
+
 ## License boundary
 
 Protocol constants and report layouts are facts and may be carried over; **do not copy source code** from GPL projects like Solaar, HeadsetControl or OpenRazer. Every device declaration must fill in `protocol_source`. When citing a GPL project, take constants only — never code.
