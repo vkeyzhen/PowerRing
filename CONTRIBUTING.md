@@ -69,6 +69,8 @@ cargo test
 cargo build --release
 ```
 
+环境：Windows + Rust stable（`x86_64-pc-windows-msvc`），依赖 VS 2022 生成工具。目前只在 Windows 上构建，跨平台支持暂不在计划内。
+
 ### 测试的命名
 
 **测试函数名用中文**，保持描述性 —— 它本质是一句断言的说明，`fn 同步来的声明盖过内置的同名设备()`
@@ -81,9 +83,26 @@ cargo build --release
 - **业务代码一律英文**（函数、变量、类型、常量）。中文只出现在测试名、注释和用户可见的文案里。
   这不是风格洁癖：`src/` 里的标识符是要被 grep、被 IDE 跳转、被外部贡献者读的。
 
-环境：Windows + Rust stable（`x86_64-pc-windows-msvc`），依赖 VS 2022 生成工具。目前只在 Windows 上构建，跨平台支持暂不在计划内。
+### 调试开关
 
-调试时可以设环境变量 `POWERRING_OPEN_SETTINGS=1`，启动时直接打开设置窗口，省一次右键。
+三个环境变量，作用都是把「本来得用鼠标点一下」的动作变成启动就自动做掉。
+右键菜单在无人值守时点不到，没有这几个开关，同步、导出这两条链路就只能靠人手动复现：
+
+| 变量 | 效果 |
+| --- | --- |
+| `POWERRING_OPEN_SETTINGS=1` | 启动即打开设置窗口（改界面尺寸时不用每次手动点开） |
+| `POWERRING_EXPORT_REPORT=1` | 启动即导出一次设备信息到剪贴板（验证「导出」整条链路） |
+| `POWERRING_SYNC=1` | 启动即同步一次设备声明（用来复现「他那边点了没反应」，看究竟卡在哪个地址上） |
+
+变量值不重要，设了就算开，release 版同样有效：
+
+```bash
+set POWERRING_SYNC=1 && target\release\powerring.exe          # cmd
+$env:POWERRING_SYNC="1"; .\target\release\powerring.exe       # PowerShell
+```
+
+`POWERRING_SYNC` 配合日志看最有用 —— 三个源是依次回退的，日志里会写清楚这次哪个地址成功、
+哪个不行，比「点了没反应」这句反馈有用得多。
 
 > Windows 10 会把新托盘图标折叠进通知区域的 `^` 里。找不到图标先去任务栏设置里打开显示。
 
