@@ -431,6 +431,17 @@ fn usage_compatible(a: Option<u16>, b: Option<u16>) -> bool {
     }
 }
 
+/// 一份解析过的远程清单。
+///
+/// `rejected` 不是装饰：只要清单里有一份没通过校验，这份清单就**不再代表远程的
+/// 完整状态** —— 缺的那台并不等于「远程把它撤回了」。清理本地旧声明时必须看这个数，
+/// 否则「远程某台写错了」会表现为「用户那台设备从面板上凭空消失」。
+pub struct Bundle {
+    pub profiles: Vec<Profile>,
+    /// 校验失败、被跳过的份数
+    pub rejected: usize,
+}
+
 /// 解析远程聚合清单：一个文件里装着多份声明。
 ///
 /// 为「检查设备声明更新」准备 —— 一次请求拿全部，而不是一台一个请求。
@@ -441,7 +452,7 @@ fn usage_compatible(a: Option<u16>, b: Option<u16>) -> bool {
 /// `from_str::<Bundle>`，「某一份的字段类型写错」（vendor_id 忘了加引号变成整数、
 /// reply_len 写成字符串、table 里的数值超过 u8……）会让整份清单解析失败，
 /// 于是所有人一台都同步不到 —— 正好与这个函数要保证的东西相反。
-pub fn parse_bundle(text: &str) -> Result<Vec<Profile>, String> {
+pub fn parse_bundle(text: &str) -> Result<Bundle, String> {
     let doc: serde_yml::Value =
         serde_yml::from_str(text).map_err(|e| format!("清单不是合法 YAML：{e}"))?;
     let devices = doc
@@ -452,23 +463,31 @@ pub fn parse_bundle(text: &str) -> Result<Vec<Profile>, String> {
         return Err("清单里一份声明都没有".to_string());
     }
     let mut out = Vec::new();
+    let mut rejected = 0;
     for v in devices {
         let raw: Raw = match serde_yml::from_value(v.clone()) {
             Ok(r) => r,
             Err(e) => {
+                rejected += 1;
                 warn!("[profile] 远程清单里有一份声明字段不对，跳过：{e}");
                 continue;
             }
         };
         match raw.compile() {
             Ok(p) => out.push(p),
-            Err(e) => warn!("[profile] 远程清单里有一份声明不对，跳过：{e}"),
+            Err(e) => {
+                rejected += 1;
+                warn!("[profile] 远程清单里有一份声明不对，跳过：{e}");
+            }
         }
     }
     if out.is_empty() {
         return Err("清单里的声明全都用不了".to_string());
     }
-    Ok(out)
+    Ok(Bundle {
+        profiles: out,
+        rejected,
+    })
 }
 
 /// 自动发现到的设备落到用户目录，下次启动直接命中，不必再探测一遍。
@@ -527,12 +546,18 @@ fn slug(p: &Profile) -> String {
 /// 第三个值不能省：目录建不出来、磁盘满、`%APPDATA%` 只读时，前两个都是 0，
 /// 而「全都已经是最新」也是 0 —— 界面若只看前两个，就会在「一份都没写进去」时
 /// 报「已经是最新了」，用户重启后发现设备还是缺的，却不知道该怀疑什么。
-pub fn save_synced(list: &[Profile], prune: bool) -> (usize, usize, usize) {
+pub fn save_synced(bundle: &Bundle, prune: bool) -> (usize, usize, usize) {
     let Some(dir) = user_devices_dir() else {
         warn!("[profile] 找不到用户声明目录（APPDATA 为空？）");
-        return (0, 0, list.len());
+        return (0, 0, bundle.profiles.len());
     };
-    if let Err(e) = fs::create_dir_all(&dir) {
+    save_synced_to(&dir, bundle, prune)
+}
+
+/// 落到指定目录。拆出来只为测试能用一个临时目录，不碰真实的 `%APPDATA%`。
+fn save_synced_to(dir: &Path, bundle: &Bundle, prune: bool) -> (usize, usize, usize) {
+    let list = &bundle.profiles;
+    if let Err(e) = fs::create_dir_all(dir) {
         warn!("[profile] 建不了用户声明目录 {:?}：{e}", dir);
         return (0, 0, list.len());
     }
@@ -594,9 +619,15 @@ pub fn save_synced(list: &[Profile], prune: bool) -> (usize, usize, usize) {
     //
     // `prune` 只在拉的是项目官方清单时为真。用户自己填了一个只含几台设备的镜像时
     // 不能清理 —— 那份清单不完整是他的自由，但按它去删别人的 synced-* 就是
-    // 拿一份「不完整的权威」去覆盖「完整的权威」，结果是设备从面板上凭空消失
-    if prune {
-        if let Ok(rd) = fs::read_dir(&dir) {
+    // 拿一份「不完整的权威」去覆盖「完整的权威」，结果是设备从面板上凭空消失。
+    //
+    // 还有两种情况同样算「这份清单不代表远程的全部」：
+    //   - 清单里有一份没通过校验（rejected > 0）：缺的那台是写错了，不是被撤回
+    //   - 本次有文件没写进去（failed > 0）：磁盘满、被杀毒锁住时，连自己的
+    //     keep 清单都不完整，此时还去删别的文件，等于用一次失败的同步搞坏本地
+    // 2026-10-28 外部审查指出：以前只看 `prune`，这两种情况都会误删。
+    if prune && bundle.rejected == 0 && failed == 0 {
+        if let Ok(rd) = fs::read_dir(dir) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if name.starts_with("synced-") && name.ends_with(".yaml") && !keep.contains(&name) {
@@ -864,13 +895,142 @@ mod tests {
 
     /// 从一段清单文本里取出第一份声明
     fn first(text: &str) -> Profile {
-        parse_bundle(text).expect("这一份应该能用").remove(0)
+        parse_bundle(text)
+            .expect("这一份应该能用")
+            .profiles
+            .remove(0)
     }
 
     fn ble() -> Profile {
         first(
             "devices:\n  - name: \"测试设备\"\n    protocol: \"ble\"\n    match:\n      vendor_id: \"0x045E\"\n      product_id: \"0x0B13\"\n    battery:\n      kind: \"percent\"\n",
         )
+    }
+
+    /// 只给本模块用的临时目录。
+    ///
+    /// 落盘相关的测试不能碰真实的 `%APPDATA%\PowerRing\devices` ——
+    /// 测试里那些「旧文件该被留下 / 该被删掉」的断言，在用户目录上执行一遍
+    /// 就等于替用户做了决定。
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("powerring-sync-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 把几份声明包成一份带 `devices:` 的清单文本
+    fn bundle_text(profiles: &[Profile]) -> String {
+        let values: Vec<serde_yml::Value> = profiles
+            .iter()
+            .map(|p| serde_yml::from_str(&to_yaml(p, NOTE_SYNCED)).unwrap())
+            .collect();
+        let mut map = serde_yml::Mapping::new();
+        map.insert(
+            serde_yml::Value::String("devices".into()),
+            serde_yml::Value::Sequence(values),
+        );
+        serde_yml::to_string(&map).unwrap()
+    }
+
+    /// 清单里有一份写错时，好条目照常更新，但**不许**拿这份不完整的清单去删旧文件。
+    ///
+    /// 这是「远程某台写错了」与「远程把那台撤回了」在两个方向上长得一模一样的地方：
+    /// 只看「这次的清单里没有它」，就会把用户本机那份有效的旧声明删掉，
+    /// 那台设备随即从面板上消失 —— 而用户什么也没做错。
+    #[test]
+    fn 部分清单校验失败时更新好条目并保留旧文件() {
+        // 两种坏法各测一遍：YAML 值类型能读出来但协议不认识，以及整段读不出来
+        for bad in ["bad-protocol", "type-error"] {
+            let dir = TestDir::new();
+            let a = ble();
+            let mut b = ble();
+            b.pid += 1;
+            let initial = parse_bundle(&bundle_text(&[a.clone(), b.clone()])).unwrap();
+            assert_eq!(save_synced_to(&dir.0, &initial, true), (2, 0, 0));
+            let old_b = dir.0.join(format!("synced-{}.yaml", slug(&b)));
+            let before = fs::read_to_string(&old_b).unwrap();
+
+            let mut updated = a;
+            updated.name = "更新后的设备".into();
+            let bad_entry = if bad == "bad-protocol" {
+                "- name: 坏条目\n  protocol: nope\n"
+            } else {
+                // vendor_id 不加引号会变成整数，取值阶段才炸
+                "- name: 坏条目\n  protocol: ble\n  match:\n    vendor_id: 1126\n    product_id: 2835\n"
+            };
+            let text = format!(
+                "{}{}",
+                bundle_text(std::slice::from_ref(&updated)),
+                bad_entry
+            );
+            let bundle = parse_bundle(&text).unwrap_or_else(|e| panic!("{e}\n---\n{text}"));
+            assert_eq!(bundle.rejected, 1, "{bad}：坏的那一份应该被计数");
+            // 好条目照常写进去
+            assert_eq!(save_synced_to(&dir.0, &bundle, true), (0, 1, 0));
+            // 不在清单里的 b 必须原样留着
+            assert_eq!(fs::read_to_string(&old_b).unwrap(), before);
+            let new_a = dir.0.join(format!("synced-{}.yaml", slug(&updated)));
+            assert_eq!(
+                fs::read_to_string(new_a).unwrap(),
+                to_yaml(&updated, NOTE_SYNCED)
+            );
+        }
+    }
+
+    /// 只有「清单完整」这一种情况才清理撤回条目，而且永远不碰用户自己的声明
+    #[test]
+    fn 完整清单才清理撤回条目且不碰用户声明() {
+        let dir = TestDir::new();
+        let a = ble();
+        let mut b = ble();
+        b.pid += 1;
+        let initial = parse_bundle(&bundle_text(&[a.clone(), b.clone()])).unwrap();
+        save_synced_to(&dir.0, &initial, true);
+        let user = dir.0.join("my-device.yaml");
+        let auto = dir.0.join("auto-device.yaml");
+        fs::write(&user, "user content").unwrap();
+        fs::write(&auto, "auto content").unwrap();
+        let current = parse_bundle(&bundle_text(&[a])).unwrap();
+        let old_b = dir.0.join(format!("synced-{}.yaml", slug(&b)));
+        // 自定义源（prune=false）即使解析完整也不能清理官方来源的声明
+        save_synced_to(&dir.0, &current, false);
+        assert!(old_b.exists());
+        // 官方源 + 完整清单：这次可以清理
+        save_synced_to(&dir.0, &current, true);
+        assert!(!old_b.exists());
+        assert_eq!(fs::read_to_string(user).unwrap(), "user content");
+        assert_eq!(fs::read_to_string(auto).unwrap(), "auto content");
+    }
+
+    /// 写盘失败时也不能清理：一次失败的同步不该顺手删掉本机还能用的声明
+    #[test]
+    fn 同步写入失败也不能清理旧声明() {
+        let dir = TestDir::new();
+        let a = ble();
+        let mut b = ble();
+        b.pid += 1;
+        let initial = parse_bundle(&bundle_text(std::slice::from_ref(&b))).unwrap();
+        save_synced_to(&dir.0, &initial, true);
+        // 用目录占住目标文件名：写文件必然失败，且不依赖权限设置
+        fs::create_dir(dir.0.join(format!("synced-{}.yaml", slug(&a)))).unwrap();
+        let current = parse_bundle(&bundle_text(&[a])).unwrap();
+        assert_eq!(save_synced_to(&dir.0, &current, true), (0, 0, 1));
+        assert!(dir.0.join(format!("synced-{}.yaml", slug(&b))).exists());
     }
 
     /// 造一份最小可用的声明，只用来测「合并时谁盖住谁」
@@ -972,7 +1132,9 @@ mod tests {
     fn 仓库里的远程清单能被解析() {
         let text = std::fs::read_to_string("remote/devices.yaml")
             .expect("读不到 remote/devices.yaml，先跑一次 tools/build_remote.py");
-        let list = parse_bundle(&text).expect("仓库里那份清单解析不了");
+        let list = parse_bundle(&text)
+            .expect("仓库里那份清单解析不了")
+            .profiles;
         assert!(
             list.len() >= 4,
             "清单里至少要有 4 份声明，实际 {}",
@@ -1114,8 +1276,9 @@ mod tests {
             \n    battery:\
             \n      kind: \"percent\"\n";
         let list = parse_bundle(text).expect("还剩一份能用的，不该整个失败");
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "好设备");
+        assert_eq!(list.rejected, 1);
+        assert_eq!(list.profiles.len(), 1);
+        assert_eq!(list.profiles[0].name, "好设备");
     }
 
     #[test]
@@ -1142,8 +1305,9 @@ mod tests {
             \n    battery:\
             \n      kind: \"percent\"\n";
         let list = parse_bundle(text).expect("类型错的那一份不该拖垮整份清单");
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "好设备");
+        assert_eq!(list.rejected, 1);
+        assert_eq!(list.profiles.len(), 1);
+        assert_eq!(list.profiles[0].name, "好设备");
     }
 
     #[test]

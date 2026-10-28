@@ -1295,11 +1295,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(o) => {
                     let wrote = o.added + o.updated;
                     // 写盘失败要单独说：全失败时 added/updated 都是 0，
-                    // 若只按那两个值生成文案，会对着「一份都没写进去」说「已经是最新了」
+                    // 若只按那两个值生成文案，会对着「一份都没写进去」说「已经是最新了」。
+                    // 校验失败同理 —— 那也是「远程有、本机没有」，不能让文案看起来一切正常
                     let head = if o.failed > 0 && wrote == 0 {
                         format!("{} 份都没能写进本机", o.failed)
                     } else if o.failed > 0 {
                         format!("写入 {} 份，另有 {} 份没写进去", wrote, o.failed)
+                    } else if o.rejected > 0 && wrote == 0 {
+                        format!("有效声明没有变化，另有 {} 份校验失败", o.rejected)
                     } else if o.added > 0 {
                         format!("新增了 {} 份设备声明", o.added)
                     } else if o.updated > 0 {
@@ -1316,12 +1319,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let mut v = vec![Line {
                         text: head,
-                        swatch: if o.failed > 0 {
+                        swatch: if o.failed > 0 || o.rejected > 0 {
                             theme::colors().warn
                         } else {
                             color_of(100, false)
                         },
                     }];
+                    if o.rejected > 0 {
+                        // 说清后果：这几份没能写进来，但本地已有的旧声明我们没删
+                        v.push(Line {
+                            text: format!("{} 份声明校验失败，本地旧声明已保留", o.rejected),
+                            swatch: theme::colors().warn,
+                        });
+                    }
                     if changed {
                         v.push(Line {
                             text: "现在就能用，不用重启".to_string(),

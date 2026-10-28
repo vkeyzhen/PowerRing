@@ -47,6 +47,10 @@ const MAX_BYTES: usize = 1024 * 1024;
 pub struct Outcome {
     /// 远程清单里一共多少份
     pub total: usize,
+    /// 校验没过、被跳过的份数。
+    /// 非 0 意味着这份清单不完整：本机没拿到的那几台是远程写错了，
+    /// 不是远程把它们撤回了 —— 所以本次一律不清理本地旧声明
+    pub rejected: usize,
     /// 新写进去的份数
     pub added: usize,
     /// 内容发生了变化的份数
@@ -103,15 +107,18 @@ fn sources(custom: Option<&str>) -> Vec<String> {
 }
 
 fn apply(body: &str, source: &str) -> Result<Outcome, String> {
-    let list = crate::profile::parse_bundle(body)?;
-    let total = list.len();
+    let bundle = crate::profile::parse_bundle(body)?;
+    // 校验失败的那几份也算进总数：界面上说「远程 6 份，写入 5 份」才对得上账，
+    // 只报 5 会让用户以为远程本来就只有 5 台
+    let total = bundle.profiles.len() + bundle.rejected;
     // 只有拉的是项目官方清单时才按它清理本地已有的那份。
     // 用户自填的镜像往往只含他自己那几台 —— 拿它去清理，会把官方清单同步来的
     // 其它设备声明一起删掉，那些设备于是从面板上消失
     let prune = source == PRIMARY || source == MIRROR;
-    let (added, updated, failed) = crate::profile::save_synced(&list, prune);
+    let (added, updated, failed) = crate::profile::save_synced(&bundle, prune);
     Ok(Outcome {
         total,
+        rejected: bundle.rejected,
         added,
         updated,
         failed,
