@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use hidapi::HidApi;
 
+use crate::debug;
 use crate::hidpp::{Battery, BatteryKind, Hidpp};
 use crate::profile::{Profile, Protocol, Transport};
 use crate::raw::RawDev;
@@ -32,6 +33,25 @@ enum Link {
     },
 }
 
+/// 一台设备的**物理身份**：不看名字，只看它是从哪个接口、哪个槽位读到的。
+///
+/// 为什么需要它：两只同型号手柄的显示名一模一样（设备自报的名字、声明名都一样），
+/// 按名字认设备会把第二只当成第一只 —— 第二只的读数永远不出现，而第一只被拔掉时
+/// 第二只还会接管它的句柄。名字只该用来显示，不该用来认人。
+///
+/// 代价：接口路径在 USB 重枚举、蓝牙重连之后可能变。那时这台设备会被当成新的一台，
+/// 旧那一行靠原有的「读不到就挪走」机制消失，中间会短暂看到两行同名。
+/// 这是有意选的：宁可闪一下，也不能把两台真设备当成一台、让其中一台永远读不到。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceId {
+    /// HID++：同一个接收器下只认 slot（GPW 的 slot 会漂移，这里记的是实际答话的那个）
+    Hid { path: String, slot: u8 },
+    /// raw：一份声明对应一种报文格式，一个接口只认一份声明（见 scan 里的说明）
+    Raw { path: String },
+    /// 蓝牙：系统枚举出来的接口标识
+    Ble(String),
+}
+
 pub struct Device {
     /// 显示名：优先用设备自报的名字，取不到才用声明名
     pub name: String,
@@ -43,6 +63,8 @@ pub struct Device {
     /// 句柄也还活着，但「怎么读它」已经不一样了。没有这一份就只能靠重启，
     /// 而界面明明说着「更新了 1 份，现在就能用」。
     pub profile: Profile,
+    /// 物理身份，重扫时用来认「是不是同一台」
+    pub id: DeviceId,
     link: Link,
 }
 
@@ -139,8 +161,6 @@ impl Device {
 pub fn scan(api: &HidApi, profiles: &[Profile]) -> Vec<Device> {
     // 同一个 HID 接口可能被多份声明引用（一个接收器上挂着多台设备），只打开一次
     let mut opened: HashMap<String, Rc<Hidpp>> = HashMap::new();
-    // raw 设备按「接口 + 声明」缓存：一份声明对应一种报文格式，不能共用
-    let mut raws: HashMap<String, Rc<RawDev>> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Device> = Vec::new();
 
@@ -187,19 +207,19 @@ pub fn scan(api: &HidApi, profiles: &[Profile]) -> Vec<Device> {
                     let Some(spec) = prof.raw.clone() else {
                         continue;
                     };
-                    let rkey = format!("{key}#{}", prof.name);
-                    let dev = match raws.get(&rkey) {
-                        Some(d) => d.clone(),
-                        None => {
-                            let Ok(h) = info.open_device(api) else {
-                                continue;
-                            };
-                            let d = Rc::new(RawDev::new(h, spec));
-                            raws.insert(rkey.clone(), d.clone());
-                            d
-                        }
+                    // 同一个接口只认一份声明。raw 是一问一答的固定报文，
+                    // 一个接口上的设备就只有一套读法；若用户对同一接口写了两份，
+                    // 那两份读的也是同一台设备，第二份进列表只会变成重复行。
+                    // 声明已按可信度排过序，先到的那份就是优先级高的
+                    if seen.contains(&key) {
+                        debug!("[scan] 接口 {} 已有 raw 声明生效，跳过 {}", key, prof.name);
+                        continue;
+                    }
+                    let Ok(h) = info.open_device(api) else {
+                        continue;
                     };
-                    scan_raw(&dev, prof, &rkey, &mut seen, &mut out);
+                    let dev = Rc::new(RawDev::new(h, spec));
+                    scan_raw(&dev, prof, &key, &mut seen, &mut out);
                 }
             }
         }
@@ -238,6 +258,7 @@ fn scan_ble(prof: &Profile, seen: &mut HashSet<String>, out: &mut Vec<Device>) {
         }
         out.push(Device {
             profile: prof.clone(),
+            id: DeviceId::Ble(node.id.clone()),
             // 用系统在蓝牙里认到的名字，比声明里的名字更贴用户看到的那台设备
             name: if node.name.is_empty() {
                 prof.name.clone()
@@ -271,6 +292,9 @@ fn scan_raw(
     }
     out.push(Device {
         profile: prof.clone(),
+        id: DeviceId::Raw {
+            path: key.to_string(),
+        },
         short: prof.short_name.clone().unwrap_or_else(|| prof.name.clone()),
         name: prof.name.clone(),
         link: Link::Raw { dev: dev.clone() },
@@ -327,6 +351,10 @@ fn scan_hidpp(
 
         out.push(Device {
             profile: prof.clone(),
+            id: DeviceId::Hid {
+                path: path_key.to_string(),
+                slot: dev_idx,
+            },
             short: prof.short_name.clone().unwrap_or_else(|| name.clone()),
             name,
             link: Link::Hidpp {

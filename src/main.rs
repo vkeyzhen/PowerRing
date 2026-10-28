@@ -107,6 +107,27 @@ fn refresh_of(offline: bool, redefined: bool) -> Refresh {
     }
 }
 
+/// 身份对不上时，列表里这一行还算不算「就是它回来了」。
+///
+/// 只在三种条件同时成立时才认：这条记录标着未连接、名字一样、声明也一样。
+///
+/// 为什么要有这个兜底：接收器拔了又插回来、蓝牙重连之后，接口路径会变，
+/// 物理身份就跟着变了，可它明明还是同一台设备 —— 不认的话，用户每次拔插
+/// 都要多等一轮「移出列表、再发现」，中间白闪一次。
+///
+/// 为什么必须限死在「未连接」：那正是「第二只同名设备」会被吞掉的那个入口。
+/// 一只新的同型号手柄插上来时，列表里那台在线设备名字、声明全都一样，
+/// 一放宽就会把新手柄的读数记到老手柄头上。
+fn is_returning(
+    offline: bool,
+    name: &str,
+    profile: &Profile,
+    dev_name: &str,
+    dev: &Profile,
+) -> bool {
+    offline && name == dev_name && profile == dev
+}
+
 /// 首次读数最多连着走几轮 5 秒短周期。
 ///
 /// 与「空列表只连续快扫 4 轮」同一个道理：短周期每轮都要刷总线、开 GATT、
@@ -853,7 +874,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // 旧句柄指向的是一个已经不存在的实例，永远不会再答话，
                     // 于是它会永远挂着「未连接」。趁它现在答话把句柄换成新的，
                     // 设备就不必经历「移出列表 — 重新发现」这一趟。
-                    if let Some(i) = watched.iter().position(|w| w.dev.name == d.name) {
+                    // 先按物理身份认人；名字只用来显示
+                    let found = watched.iter().position(|w| w.dev.id == d.id).or_else(|| {
+                        watched.iter().position(|w| {
+                            is_returning(
+                                w.offline,
+                                &w.dev.name,
+                                &w.dev.profile,
+                                &d.name,
+                                &d.profile,
+                            )
+                        })
+                    });
+                    if let Some(i) = found {
                         let w = &mut watched[i];
                         // 声明变了没有？同步来一份新声明后，设备本身和句柄都还在，
                         // 只是「怎么读它」不一样了。以前这里只处理「离线又回来」，
@@ -1597,11 +1630,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of, tray_ring, ReadingState,
-        Refresh, Status, Tier, FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
+        is_returning, popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of, tray_ring,
+        ReadingState, Refresh, Status, Tier, FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
     };
     use crate::hidpp::ReadingSource;
     use crate::settings;
+
+    /// 造一份只有 product_id 不同的声明，用来区分「同一台」和「另一台」
+    fn profile_of(pid: &str) -> crate::profile::Profile {
+        let text = r#"devices:
+- name: 同名手柄
+  protocol: ble
+  match:
+    vendor_id: '0x045E'
+    product_id: 'PID'
+  battery:
+    kind: percent
+"#
+        .replace("PID", pid);
+        crate::profile::parse_bundle(&text)
+            .expect("测试声明应该能解析")
+            .profiles
+            .remove(0)
+    }
+
+    /// 接口路径变了（接收器拔插、蓝牙重连）之后，还得认得出是同一台设备
+    /// —— 但只能认那些标着「未连接」的行
+    #[test]
+    fn 只有未连接那一行才算它回来了() {
+        let a = profile_of("0x0B13");
+        assert!(is_returning(true, "同名手柄", &a, "同名手柄", &a));
+        // 在线的那行不能被抢：这正是第二只同型号设备被吞掉的老路
+        assert!(
+            !is_returning(false, "同名手柄", &a, "同名手柄", &a),
+            "在线设备不该被同名的新设备接管"
+        );
+        // 名字一样、声明不一样：那是另一台设备
+        let b = profile_of("0x0B14");
+        assert!(!is_returning(true, "同名手柄", &a, "同名手柄", &b));
+        // 名字不一样、声明一样：也不认
+        assert!(!is_returning(true, "别的名字", &a, "同名手柄", &a));
+    }
 
     /// 声明没变、设备也还在线：这一轮什么都不该做。
     ///
