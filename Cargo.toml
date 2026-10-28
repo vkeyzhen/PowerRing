@@ -1,6 +1,6 @@
 [package]
 name = "power-ring"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Windows 无线外设电量监测工具（托盘电量环）"
 license = "MIT"

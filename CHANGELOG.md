@@ -3,7 +3,7 @@
 本项目的所有值得记录的改动都写在这里。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.5] — 2026-10-28
 
 主题：**设备不是靠名字互相区分的**。
 
@@ -372,3 +372,4 @@ release 产物约 930 KB（验收线 5 MB）。release profile 用的是 `opt-le
 [0.2.2]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.2
 [0.2.3]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.3
 [0.2.4]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.4
+[0.2.5]: https://github.com/vkeyzhen/PowerRing/releases/tag/v0.2.5
