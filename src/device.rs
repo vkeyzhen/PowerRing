@@ -37,6 +37,12 @@ pub struct Device {
     pub name: String,
     /// 托盘悬停用的短名。来自声明的 short，没有就用声明名
     pub short: String,
+    /// 构造这台设备时用的是哪一份声明。
+    ///
+    /// 存一份快照是为了在重扫时对比：同步来了新声明之后，设备本身没变、
+    /// 句柄也还活着，但「怎么读它」已经不一样了。没有这一份就只能靠重启，
+    /// 而界面明明说着「更新了 1 份，现在就能用」。
+    pub profile: Profile,
     link: Link,
 }
 
@@ -231,6 +237,7 @@ fn scan_ble(prof: &Profile, seen: &mut HashSet<String>, out: &mut Vec<Device>) {
             continue;
         }
         out.push(Device {
+            profile: prof.clone(),
             // 用系统在蓝牙里认到的名字，比声明里的名字更贴用户看到的那台设备
             name: if node.name.is_empty() {
                 prof.name.clone()
@@ -263,6 +270,7 @@ fn scan_raw(
         return;
     }
     out.push(Device {
+        profile: prof.clone(),
         short: prof.short_name.clone().unwrap_or_else(|| prof.name.clone()),
         name: prof.name.clone(),
         link: Link::Raw { dev: dev.clone() },
@@ -318,6 +326,7 @@ fn scan_hidpp(
             .unwrap_or_else(|| prof.name.clone());
 
         out.push(Device {
+            profile: prof.clone(),
             short: prof.short_name.clone().unwrap_or_else(|| name.clone()),
             name,
             link: Link::Hidpp {

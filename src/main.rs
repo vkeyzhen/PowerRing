@@ -80,6 +80,33 @@ enum Arm {
     Spent,
 }
 
+/// 重扫时碰上一台已经在列表里的设备，该做什么。
+///
+/// 抽出来是为了能单测：三种情况的区别很细（换不换句柄、清不清旧读数），
+/// 而它们出错的表现都是「数字看着不太对」，现场很难判断是哪一种。
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// 同一份声明、也还在线：什么都不用做。
+    /// 特别**不要**换句柄 —— 每轮都换等于每轮重建连接
+    Keep,
+    /// 离线过又回来了：只换句柄，上次的读数还能用
+    Reconnect,
+    /// 声明变了：换读取器，并且把旧读数清掉 —— 那个数是按旧规则算的
+    Redefined,
+}
+
+/// 由「是否离线」「声明是否变了」决定动作。声明变了优先：
+/// 这时无论设备在不在线，旧读数都不能留
+fn refresh_of(offline: bool, redefined: bool) -> Refresh {
+    if redefined {
+        Refresh::Redefined
+    } else if offline {
+        Refresh::Reconnect
+    } else {
+        Refresh::Keep
+    }
+}
+
 /// 首次读数最多连着走几轮 5 秒短周期。
 ///
 /// 与「空列表只连续快扫 4 轮」同一个道理：短周期每轮都要刷总线、开 GATT、
@@ -828,14 +855,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // 设备就不必经历「移出列表 — 重新发现」这一趟。
                     if let Some(i) = watched.iter().position(|w| w.dev.name == d.name) {
                         let w = &mut watched[i];
-                        if w.offline {
-                            info!("[scan] {} 重新连上了，换用新句柄", d.name);
+                        // 声明变了没有？同步来一份新声明后，设备本身和句柄都还在，
+                        // 只是「怎么读它」不一样了。以前这里只处理「离线又回来」，
+                        // 于是界面说「更新了 1 份，现在就能用」，读数却还是按旧规则算，
+                        // 得重启才生效 —— 而且新旧两套规则都自称正确，用户无从分辨
+                        let action = refresh_of(w.offline, w.dev.profile != d.profile);
+                        if action != Refresh::Keep {
+                            match action {
+                                Refresh::Reconnect => {
+                                    info!("[scan] {} 重新连上了，换用新句柄", d.name)
+                                }
+                                Refresh::Redefined => {
+                                    info!("[scan] {} 的声明变了，换用新的读取规则", d.name)
+                                }
+                                Refresh::Keep => unreachable!("上面已经排除了"),
+                            }
                             w.dev = d;
                             w.offline = false;
                             w.misses = 0;
                             // 刚插回来的设备未必立刻答得上来，
                             // 给它重新享受几轮短周期，别一上来就干等 60 秒
                             w.reading = ReadingState::default();
+                            if action == Refresh::Redefined {
+                                // 旧读数是按旧规则算出来的：不能拿来平滑（那会把
+                                // 新规则的第一个读数拽向旧值），也不能继续挂在界面上
+                                // 冒充新规则的结果。清掉，下一轮重新读
+                                w.percent = None;
+                                w.charging = false;
+                                w.source = ReadingSource::Live;
+                                // 提醒的弹药不动：声明更新不是「重新开机」，
+                                // 已经弹过的低电提醒不该因为改了个换算表再弹一次
+                            }
                         }
                         continue;
                     }
@@ -1547,11 +1597,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        popup_lines, smooth, tier_of, tip_line, tooltip_of, tray_ring, ReadingState, Status, Tier,
-        FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
+        popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of, tray_ring, ReadingState,
+        Refresh, Status, Tier, FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
     };
     use crate::hidpp::ReadingSource;
     use crate::settings;
+
+    /// 声明没变、设备也还在线：这一轮什么都不该做。
+    ///
+    /// 特别是**不换句柄** —— 每轮重扫都换，等于每 60 秒重新连一次设备，
+    /// 蓝牙那边会明显变慢，HID 侧则多出一次不必要的打开
+    #[test]
+    fn 普通重扫不动在线设备() {
+        assert_eq!(refresh_of(false, false), Refresh::Keep);
+    }
+
+    /// 离线又回来：换句柄（旧的那个指向已经不存在的实例），读数留着还能用
+    #[test]
+    fn 离线回来只换句柄() {
+        assert_eq!(refresh_of(true, false), Refresh::Reconnect);
+    }
+
+    /// 声明变了：在线也要换读取规则，旧读数必须清掉。
+    /// 否则界面说着「更新了 1 份」，读数还是按旧换算表算的，重启后才变
+    #[test]
+    fn 声明变了在线设备也换读取规则() {
+        assert_eq!(refresh_of(false, true), Refresh::Redefined);
+        // 离线且声明变了：以声明为准，同样要清读数
+        assert_eq!(refresh_of(true, true), Refresh::Redefined);
+    }
 
     /// 只报档位、永远给不出百分比的设备：读到一次就该结束短周期。
     ///
