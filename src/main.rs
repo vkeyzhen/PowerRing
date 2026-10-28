@@ -80,6 +80,46 @@ enum Arm {
     Spent,
 }
 
+/// 首次读数最多连着走几轮 5 秒短周期。
+///
+/// 与「空列表只连续快扫 4 轮」同一个道理：短周期每轮都要刷总线、开 GATT、
+/// 发探测报文（还会叫醒睡着的设备），不能无限期地跑下去。4 轮 ≈ 20 秒，
+/// 盖得住开机时接收器晚应答那一段。
+const FAST_RETRY_LIMIT: u8 = 4;
+
+/// 「这台设备的第一次读数还没拿到」的记账。
+///
+/// 关键点：**读到设备**和**读到百分比**是两件事。只报粗档位、不报百分比的设备
+/// 每一轮都在答应，可它永远不会给出一个数字 —— 以前拿 `percent.is_none()`
+/// 当「还没初始化」，这类设备就让整条轮询线永远停在 5 秒周期，
+/// 顺带把别的设备也拖成 5 秒读一次。
+///
+/// 抽成独立类型是为了能单测：这个判断决定整条轮询线的节奏，
+/// 写错的表现是「费电、设备老被叫醒」，不会有人报成 bug。
+#[derive(Debug, Default)]
+struct ReadingState {
+    /// 成功读到过一次（有没有百分比都算）
+    received: bool,
+    /// 参与过快轮询的轮数
+    attempts: u8,
+}
+
+impl ReadingState {
+    /// 每轮读取前调用一次
+    fn begin_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// 读到设备了 —— 哪怕这次没给出百分比，也算「不需要再快试了」
+    fn record_success(&mut self) {
+        self.received = true;
+    }
+
+    fn pending(&self) -> bool {
+        !self.received && self.attempts < FAST_RETRY_LIMIT
+    }
+}
+
 /// 手绘电量环图标：32×32 RGBA，零图像处理依赖（这正是「PowerRing」的由来）
 /// percent 为 None 表示「未知」—— 画成全灰环，绝不用 0% 冒充读不到（PRD F2）
 fn ring_icon(percent: Option<u8>, charging: bool) -> Icon {
@@ -532,6 +572,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             /// 承载它的硬件已经不在系统上了：接收器被拔、蓝牙设备从系统里消失。
             /// 这是硬证据，本轮直接移出，不必攒失败次数
             detached: bool,
+            /// 第一次读数拿到了没有。与 percent 分开记 —— 见 ReadingState
+            reading: ReadingState,
+            /// 提醒的首次百分比是否已经用来装填弹药。
+            /// 不能用 percent.is_none() 代替：那会让「充着电读到未知 → 拔线读到数字」
+            /// 被当成又一次「刚开机」，把已经弹过的那档重新装弹
+            alert_initialized: bool,
+        }
+
+        impl Watched {
+            fn new(dev: device::Device) -> Self {
+                Self {
+                    dev,
+                    percent: None,
+                    charging: false,
+                    source: ReadingSource::Live,
+                    arm_critical: Arm::Armed,
+                    arm_warn: Arm::Armed,
+                    misses: 0,
+                    offline: false,
+                    detached: false,
+                    reading: ReadingState::default(),
+                    alert_initialized: false,
+                }
+            }
+
+            /// 这台设备还要不要走 5 秒短周期
+            fn needs_fast_retry(&self) -> bool {
+                // 未连接的设备不算「还没读出来」—— 它读出来过，只是现在联系不上。
+                // 算进去的话轮询会永久卡在 5 秒一轮，白费力气（还会一直叫醒它）
+                !self.offline && self.reading.pending()
+            }
         }
 
         /// 连续读不到几次就把设备移出列表。
@@ -702,20 +773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         warn!("[scan] 首轮匹配到 {} 台设备", devices.len());
 
-        let mut watched: Vec<Watched> = devices
-            .into_iter()
-            .map(|d| Watched {
-                dev: d,
-                percent: None,
-                charging: false,
-                source: ReadingSource::Live,
-                arm_critical: Arm::Armed,
-                arm_warn: Arm::Armed,
-                misses: 0,
-                offline: false,
-                detached: false,
-            })
-            .collect();
+        let mut watched: Vec<Watched> = devices.into_iter().map(Watched::new).collect();
         let mut last_scan = Instant::now();
         // 刚有设备消失时置为中短期的截止时刻，在这之前都当它「随时会回来」
         let mut return_until: Option<Instant> = None;
@@ -746,20 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info!("[scan] 发现设备：{}", d.name);
                     }
                     return_until = None; // 回来了，恢复常规重扫节奏
-                    watched = fresh
-                        .into_iter()
-                        .map(|d| Watched {
-                            dev: d,
-                            percent: None,
-                            charging: false,
-                            source: ReadingSource::Live,
-                            arm_critical: Arm::Armed,
-                            arm_warn: Arm::Armed,
-                            misses: 0,
-                            offline: false,
-                            detached: false,
-                        })
-                        .collect();
+                    watched = fresh.into_iter().map(Watched::new).collect();
                 }
                 last_scan = Instant::now();
             } else if last_scan.elapsed()
@@ -788,35 +833,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             w.dev = d;
                             w.offline = false;
                             w.misses = 0;
+                            // 刚插回来的设备未必立刻答得上来，
+                            // 给它重新享受几轮短周期，别一上来就干等 60 秒
+                            w.reading = ReadingState::default();
                         }
                         continue;
                     }
                     info!("[scan] 发现新设备：{}", d.name);
                     // 它回来了，不用再按「可能有设备要回来」的密度扫总线
                     return_until = None;
-                    watched.push(Watched {
-                        dev: d,
-                        percent: None,
-                        charging: false,
-                        source: ReadingSource::Live,
-                        arm_critical: Arm::Armed,
-                        arm_warn: Arm::Armed,
-                        misses: 0,
-                        offline: false,
-                        detached: false,
-                    });
+                    watched.push(Watched::new(d));
                 }
             }
 
             let mut alerts: Vec<Alert> = Vec::new();
             for w in watched.iter_mut() {
+                // 记一次尝试：读不出来也要记，否则「一直读不出来的设备」
+                // 会让短周期永远停不下来
+                w.reading.begin_attempt();
                 match w.dev.read() {
                     Some(b) => {
                         w.misses = 0;
                         w.offline = false;
                         w.detached = false;
-                        // 是不是这台设备的第一次读数：弹药的初始状态由它决定
-                        let fresh = w.percent.is_none();
+                        // 读到设备就算成功，哪怕这一次没给出百分比
+                        w.reading.record_success();
+                        // 弹药的初始装填只做一次，用的是第一个**有效的**百分比。
+                        // 未知读数（充着电、只报档位）不参与，也不该让它重置弹药
+                        let fresh = !w.alert_initialized;
+                        if b.percent.is_some() {
+                            w.alert_initialized = true;
+                        }
                         if w.percent != b.percent {
                             info!(
                                 "[battery] {} → {} mV {:?}%（来源：{}）",
@@ -940,10 +987,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 只要还有设备从没读出来过，就用 5 秒短间隔重试，而不是干等一整轮。
             // 实测：开机或上一进程被强杀后，接收器会有几十秒不响应，
             // 若按 60 秒轮询，面板会长时间挂着「--」，看起来像坏了。
-            // 未连接的设备不算「还没读出来」—— 它读出来过，只是现在联系不上。
-            // 算进去的话轮询会永久卡在 5 秒一輪，白费力气
-            let still_pending =
-                watched.is_empty() || watched.iter().any(|w| w.percent.is_none() && !w.offline);
+            //
+            // 但「没读出百分比」不等于「没读出来」：只报档位的设备每一轮都在答应，
+            // 却永远给不出数字，把它算进来就等于永远 5 秒一轮（还会顺带叫醒别的设备）。
+            // 所以看的是 ReadingState：读到过就结束，读不到也只快试有限几轮
+            let still_pending = watched.is_empty() || watched.iter().any(|w| w.needs_fast_retry());
             // 空列表的短周期只连续用几轮：见 empty_scans 的说明。
             // 一旦检出设备就清零，下次真的空下来仍然享受那几轮快速重试
             if watched.is_empty() {
@@ -1499,11 +1547,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        popup_lines, smooth, tier_of, tip_line, tooltip_of, tray_ring, Status, Tier, SUBMIT_URL,
-        TIP_MAX_CHARS,
+        popup_lines, smooth, tier_of, tip_line, tooltip_of, tray_ring, ReadingState, Status, Tier,
+        FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
     };
     use crate::hidpp::ReadingSource;
     use crate::settings;
+
+    /// 只报档位、永远给不出百分比的设备：读到一次就该结束短周期。
+    ///
+    /// 这是「读不到电量」和「读不到设备」被混为一谈的地方 —— 那一台会替所有
+    /// 设备决定轮询节奏，表现是整晚每 5 秒刷一遍总线
+    #[test]
+    fn 未知百分比也算读到了() {
+        let mut s = ReadingState::default();
+        s.begin_attempt();
+        assert!(s.pending(), "第一轮还没读到，应该继续快试");
+        s.record_success();
+        assert!(!s.pending(), "设备答应了但没给数字，也不该继续 5 秒一轮");
+        // 之后再失败也不退回初始化状态
+        s.begin_attempt();
+        assert!(!s.pending());
+    }
+
+    /// 怎么都读不到的设备（声明写错了、设备根本没插）不能把轮询线永久钉在 5 秒
+    #[test]
+    fn 读不到的设备只快试有限轮() {
+        let mut s = ReadingState::default();
+        for _ in 0..FAST_RETRY_LIMIT - 1 {
+            s.begin_attempt();
+            assert!(s.pending(), "还没到上限，应该继续快试");
+        }
+        s.begin_attempt();
+        assert!(!s.pending(), "到上限就该退回正常周期");
+        // 再往后也不该自己复活
+        s.begin_attempt();
+        assert!(!s.pending());
+    }
 
     /// 收集页的链接是写死在程序里的，改的时候容易手滑：
     /// 少个 s、多截一个字符，点下去就是 404，而这个错只有真去点才会发现。
