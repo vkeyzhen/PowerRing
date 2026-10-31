@@ -168,10 +168,29 @@ impl ReadingState {
     }
 }
 
+/// 图标边长。抽成模块常量是为了让测试能按坐标取像素
+const RING_SIZE: usize = 32;
+
 /// 手绘电量环图标：32×32 RGBA，零图像处理依赖（这正是「PowerRing」的由来）
-/// percent 为 None 表示「未知」—— 画成全灰环，绝不用 0% 冒充读不到（PRD F2）
+///
+/// percent 为 None 有两种来源，画法不同：
+/// - 纯未知（离线、读不到）：全灰环，绝不用 0% 冒充读不到（PRD F2）
+/// - charging 为 true（充电中但读数无效）：整环暗蓝 —— 用户已经确认过要这个色，
+///   但**特意不用满电那只亮蓝**，否则「真读到 100%」和「不知道充到多少」在托盘上
+///   长得一模一样，能看见的就只剩悬停文字了
 fn ring_icon(percent: Option<u8>, charging: bool) -> Icon {
-    const S: usize = 32;
+    Icon::from_rgba(
+        ring_rgba(percent, charging),
+        RING_SIZE as u32,
+        RING_SIZE as u32,
+    )
+    .expect("构造图标失败")
+}
+
+/// 像素生成与 `Icon` 构造分开：`Icon` 读不回像素，而配色恰恰是这里最容易错的地方，
+/// 拆出来测试才能真的采样环上的颜色，而不是只断言「调用没崩」。
+fn ring_rgba(percent: Option<u8>, charging: bool) -> Vec<u8> {
+    const S: usize = RING_SIZE;
     let mut rgba = vec![0u8; S * S * 4];
     let c = (S as f32 - 1.0) / 2.0;
     let r_out = 15.2_f32;
@@ -195,7 +214,8 @@ fn ring_icon(percent: Option<u8>, charging: bool) -> Icon {
                 ang += 360.0;
             }
             let (r, g, b) = match percent {
-                None => unknown, // 未知：整环灰
+                None if charging => CHARGING_BLUE_DIM, // 充电中但读不到电量：整环暗蓝
+                None => unknown,                       // 未知：整环灰
                 Some(p) if ang <= filled_deg => color_of(p, charging),
                 Some(_) => dim, // 未填充部分
             };
@@ -203,7 +223,7 @@ fn ring_icon(percent: Option<u8>, charging: bool) -> Icon {
             rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
         }
     }
-    Icon::from_rgba(rgba, S as u32, S as u32).expect("构造图标失败")
+    rgba
 }
 
 /// 读数滞回：变化不足 2 个百分点就不动。
@@ -386,6 +406,13 @@ fn tier_of(percent: Option<u8>, charging: bool) -> Tier {
 /// 免得同一个「充电」在不同地方差一点点色
 const CHARGING_BLUE: (u8, u8, u8) = (52, 152, 219);
 
+/// 充电中但读不到电量的整环色：同一只蓝压暗一档。
+///
+/// 只用在同一处 —— `ring_icon` 的整环。托盘环只有颜色和弧长两样东西，
+/// 整环亮蓝跟「真的 100%」分不出来；压暗之后两者一眼能分，又不至于像灰环那样
+/// 让人以为「没在充电」。
+const CHARGING_BLUE_DIM: (u8, u8, u8) = (37, 106, 153);
+
 fn color_of(percent: u8, charging: bool) -> (u8, u8, u8) {
     match tier_of(Some(percent), charging) {
         Tier::Charging => CHARGING_BLUE, // 充电中：蓝
@@ -411,13 +438,13 @@ fn icon_rect(tray: &TrayIcon) -> Option<(i32, i32, i32, i32)> {
     ))
 }
 
-/// 面板里那一小块颜色。与托盘环**故意不一致**，理由见下面两条注释：
+/// 面板里那一小块颜色。与托盘环比**深浅**，理由见下面两条注释：
 ///
 /// 有数字：跟托盘环同一套语义，用户看环和看面板不需要重新学。
 ///
-/// 只知道在充电、不知道充到哪儿：这里画蓝，托盘环那里画灰。
-/// 区别在于**这一行旁边就写着「充电中（电量未知）」**，蓝色不会单独承担含义；
-/// 而托盘环只有颜色和弧长两样东西，整环变蓝看起来就是「100%」——
+/// 只知道在充电、不知道充到哪儿：这里用正常那只亮蓝，托盘环用压暗一档的蓝。
+/// 面板这一行旁边就写着「充电中（电量未知）」，蓝色不会单独承担含义，亮一点无妨；
+/// 而托盘环只有颜色和弧长两样东西 —— 整环用满电那只亮蓝，看起来就是「100%」，
 /// 那正好是 issue #10 要避免的：不拿一个编出来的档位冒充读数。
 fn swatch_of(s: &Status) -> (u8, u8, u8) {
     match s.percent {
@@ -432,15 +459,20 @@ fn swatch_of(s: &Status) -> (u8, u8, u8) {
 /// 环只画一台 —— 电量最低的那台，因为它是唯一需要人动手的。颜色必须跟着**同一台**：
 /// 以前这里是「任意一台在充电就整环变蓝」，于是 5% 的鼠标会被旁边正在充电的耳机
 /// 染成蓝色，最该被看见的红环就这么没了。
+///
+/// percent 为 None 且 charging 为 true = 「充着电，但这次读数不作数」(#10)。
+/// 这种情况才允许第二台设备影响环：一台数字都没有时，有设备在充电总比灰环信息量大。
 fn tray_ring(latest: &[Status]) -> (Option<u8>, bool) {
-    match latest
+    if let Some((p, c)) = latest
         .iter()
         .filter_map(|s| s.percent.map(|p| (p, s.charging)))
         .min_by_key(|(p, _)| *p)
     {
-        Some((p, c)) => (Some(p), c),
-        None => (None, false),
+        return (Some(p), c);
     }
+    // 一台都给不出数：只要其中有一台**确实**在充电，就画充电蓝而不是灰。
+    // 灰环说的是「不知道，也没在充」，这里明确知道它在充，不该抹掉
+    (None, latest.iter().any(|s| s.charging))
 }
 
 /// 只允许一个 PowerRing 在跑。返回 false 表示已经有实例了，本进程该退出。
@@ -1643,9 +1675,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_returning, popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of, tray_ring,
-        ReadingState, Refresh, Status, Tier, CHARGING_BLUE, FAST_RETRY_LIMIT, SUBMIT_URL,
-        TIP_MAX_CHARS,
+        color_of, is_returning, popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of,
+        tray_ring, ReadingState, Refresh, Status, Tier, CHARGING_BLUE, CHARGING_BLUE_DIM,
+        FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
     };
     use crate::hidpp::ReadingSource;
     use crate::settings;
@@ -1810,14 +1842,40 @@ mod tests {
         assert_eq!(tip_line(&c, "天箭"), "天箭 充电中（电量未知）");
         let row = &popup_lines(std::slice::from_ref(&c))[0];
         assert_eq!(row.text, "HyperX 天箭  充电中（电量未知）");
-        // 面板那块颜色可以画蓝：紧挨着的文字已经把「不知道多少」说清楚了
+        // 面板那块颜色用正常亮蓝：紧挨着的文字已经把「不知道多少」说清楚了
         assert_eq!(row.swatch, CHARGING_BLUE);
-        // 托盘环不行：整环变蓝看起来就是 100%，而这里根本没有档位可画
-        assert_eq!(tray_ring(std::slice::from_ref(&c)), (None, false));
+        // 托盘环也画蓝，但得告诉调用方「这是充电」，好让它用压暗那一档
+        assert_eq!(tray_ring(std::slice::from_ref(&c)), (None, true));
+        // 只有颜色不同还不够：满电的亮蓝和这只暗蓝必须能分开，
+        // 否则「读到 100%」和「不知道充到多少」在托盘上一模一样
+        assert_ne!(CHARGING_BLUE, CHARGING_BLUE_DIM);
         // 悬停文字也不该出现任何数字
         assert!(!tooltip_of(std::slice::from_ref(&c))
             .chars()
             .any(|ch| ch.is_ascii_digit()));
+    }
+
+    /// 环色不能只靠「常量不相等」来保证：真去采样像素，确认整环画出来的就是那只暗蓝，
+    /// 而且跟「真读到 100%」的亮蓝确实分得开（#10）
+    #[test]
+    fn 充电中读不到电量时整环是暗蓝() {
+        let at = |rgba: &[u8], x: usize, y: usize| {
+            let i = (y * super::RING_SIZE + x) * 4;
+            (rgba[i], rgba[i + 1], rgba[i + 2])
+        };
+        // 环上 12 点与 6 点各取一点：整环任意角度都该是同一只色
+        let charging = super::ring_rgba(None, true);
+        assert_eq!(at(&charging, 16, 2), CHARGING_BLUE_DIM);
+        assert_eq!(at(&charging, 16, 29), CHARGING_BLUE_DIM);
+
+        // 真的读到满电：也是整环，但是亮蓝
+        let full = super::ring_rgba(Some(100), false);
+        assert_eq!(at(&full, 16, 2), color_of(100, false));
+        assert_ne!(at(&full, 16, 2), CHARGING_BLUE_DIM);
+
+        // 纯未知（也没在充电）还是灰环 —— 别把两种情况混成一个样
+        let unknown = super::ring_rgba(None, false);
+        assert_eq!(at(&unknown, 16, 2), crate::theme::colors().ring_unknown);
     }
 
     #[test]
@@ -1906,8 +1964,17 @@ mod tests {
         mouse.charging = true;
         assert_eq!(tray_ring(&[mouse]), (Some(80), true));
 
-        // 一台都给不出数：灰环，不是「0%」
+        // 一台数字都给不出：灰环，不是「0%」
         assert_eq!(tray_ring(&[offline("GPW", "GPW")]), (None, false));
+
+        // 但如果其中一台确实在充电，环该是蓝的（暗一档），不能灰 ——
+        // 灰环说的是「不知道，也没在充」，这里明确知道它在充
+        let mut charging_none = s("天箭", "天箭", None);
+        charging_none.charging = true;
+        assert_eq!(
+            tray_ring(&[offline("GPW", "GPW"), charging_none]),
+            (None, true)
+        );
     }
 
     /// 滞回是为了防抖，不该把「刚好跨过阈值」也吞掉（issue #9）：

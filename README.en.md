@@ -16,7 +16,7 @@ Battery monitor for wireless peripherals on Windows. A ring in the tray tells yo
 
 | Feature | Notes |
 | --- | --- |
-| Tray battery ring | Ring fill maps to remaining charge. Green → orange → red as it drains, blue while charging. **Unreadable is shown as a grey ring — never as 0%** |
+| Tray battery ring | Ring fill maps to remaining charge. Green → orange → red as it drains, blue while charging (a dimmer blue when it is charging but the exact level can't be read). **Unreadable is shown as a grey ring — never as 0%** |
 | Hover readout | Shows percentage per device. With multiple devices it uses short names, sorted lowest first |
 | Left click | Toggles the battery panel with every device's full name and level |
 | Right click menu | Show panel / Refresh now / Settings… / Exit |
