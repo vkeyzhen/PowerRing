@@ -38,6 +38,7 @@ Settings expose the refresh interval, warning and critical thresholds, the alert
 | Logitech G PRO Wireless (plugged in) | **USB cable** `046D:C088`, usage page `FF00` / usage `0002` | same `0x1001` feature | Verified. 4101 mV reads as 93%, correctly shown as charging |
 | HyperX Cloud Flight | receiver `0951:1723`, usage page `FF90` / usage `0303` | vendor report `21 FF 05` (direct mode) | Verified, stable and self-consistent (raw 231 reads as 60%); the vendor app shows no percentage, so there is no external reference |
 | Xbox Wireless Controller (Series) | **Bluetooth**, VID `045E` / PID `0B13` | standard Battery Service `0x180F` / `0x2A19` | Verified. Matches Windows' Bluetooth settings (checked at 93% and at 12%) |
+| AULA MK75 (mechanical keyboard) | receiver `3554:FA09`, usage page `FF02` / usage `0002` | vendor report `13 05` (two replies per query) | Verified. At 87% the keyboard's own battery LED (Fn+B) lights up to the 8th key; while charging the reading climbs 89% → 93% |
 
 ### How accurate are the numbers
 
@@ -52,6 +53,10 @@ Short version: **anything that reports a percentage itself reads exactly what th
 That ±1% is left alone deliberately: **it is not an offset you can shift away.** The sign flipping says the difference does not come from the curve sitting 1% off, but from the two sides sampling at different moments and rounding differently. Nudging a shared curve to suit one device would spoil it for every other Logitech one. If you want to settle it: let the mouse sit still for a few minutes and read both sides on the same instant.
 
 One caveat on the Cloud Flight: its `verified` **does not include "cross-checked against the vendor reading"** — HyperX's NGENUITY app does not show a percentage at all, so there is nothing to compare against. The same caveat is recorded in `devices/hyperx_cloud_flight.yaml`.
+
+The AULA MK75 sits between the two cases: **there is a reference, but it only has 10-step resolution**. Pressing Fn+B lights up the number row to show the level; at 87% it lit up to the 8th key, which lines up. While charging the reading climbed 89% → 93% and dropped back the moment the cable was pulled, so the trend agrees too. That makes it more trustworthy than the Cloud Flight, but not as nailed down as a point-by-point comparison against G HUB. Its vendor driver **does not show a battery percentage at all** — this program is the only way to get an actual number out of this keyboard.
+
+The same receiver is not exclusive to AULA: the AULA F75 / F99 Pro / X99 Pro share the exact same VID:PID (it is a Compx design). Those were not tested here, but the protocol is very likely identical — copy `devices/aula_mk75.yaml`, change `name`, and it should just work.
 
 The **Xbox controller row** needs no reverse engineering at all: the Bluetooth SIG standardised how to read battery level, so any compliant device is read by UUID and its YAML carries not a single byte of a report. To list every such device on your machine:
 
