@@ -6,6 +6,40 @@
 # 注释在打包时被丢掉了：它们在仓库的 devices/*.yaml 里照样能读到，
 # 而这份清单是给机器读的，多带几 KB 注释只是让同步白白变慢。
 devices:
+  - name: "凌豹 MK75"
+    short: "MK75"
+    protocol: "raw"
+    transport: "direct"
+    match:
+      vendor_id: "0x3554"      # Compx
+      product_id: "0xFA09"     # 2.4G Wireless Receiver
+      usage_page: "0xFF02"
+      usage: "0x0002"
+    battery:
+      request: "13 05"
+      reply_len: 20
+      reply_prefix: "13 0A 01 00 04 05"
+      value_index: 6
+      state_index: 7
+      charging_mask: "0x10"
+    protocol_source: "Compx 2.4G 接收器（3554:FA09）报文格式，参考 harshvats17/f75-linux-manager 与 oneday5799 的公开排障记录，并逐帧核对校验和"
+    verification: "verified"
+    notes: >
+      报文结构是固定 20 字节：13 <命令/类型> <总页数> <页号> <载荷长度> <载荷…> <校验和>，
+      校验和是前 20 字节里除末字节外全部相加取低 8 位。本文件里那两条报文都实测对得上。
+      排查时踩过的坑，留给后来的人：
+      1. 应答帧第二字节等于请求的命令号（0x42/0x43/0x44 都是这样），
+         但 0x0A 不是命令而是**通知类型** —— 拿 0x0A 当命令去问，永远没有回应。
+         真正的查询命令是 0x05。
+      2. 一问会回两帧，只读一帧会读到状态帧里那个恒为 0 的字节。
+      3. 0x05 的应答里有一个 0xC6 字节，不随电量变化（插线/拔线/电量 87→93 都不变），
+         不要拿它当电量。
+      **读数基准**：实测 87% 时，键盘自身的 Fn+B 电量灯亮到 F8（共 10 格），
+      两者一致；充电中 89%→93% 一路递增，拔线立刻回到 0x01。这是目前唯一
+      有外部基准可对照的一台 raw 设备（天箭没有），所以标 verified。
+      已知限制：只能读到电量，读不到键盘的灯效、按键映射等配置项。
+      配套驱动也不显示电量百分比，本声明是唯一能拿到数字的途径。
+
   - name: "HyperX Cloud Flight"
     short: "Cloud Flight"
     protocol: "raw"
