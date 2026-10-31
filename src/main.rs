@@ -382,12 +382,16 @@ fn tier_of(percent: Option<u8>, charging: bool) -> Tier {
     }
 }
 
+/// 充电中统一用这只蓝。三处（环、色块、设置窗口的预览）都从这里取，
+/// 免得同一个「充电」在不同地方差一点点色
+const CHARGING_BLUE: (u8, u8, u8) = (52, 152, 219);
+
 fn color_of(percent: u8, charging: bool) -> (u8, u8, u8) {
     match tier_of(Some(percent), charging) {
-        Tier::Charging => (52, 152, 219), // 充电中：蓝
-        Tier::Critical => (192, 57, 43),  // 严重：红
-        Tier::Warn => (230, 126, 34),     // 警告：橙
-        _ => (39, 174, 96),               // 正常：绿
+        Tier::Charging => CHARGING_BLUE, // 充电中：蓝
+        Tier::Critical => (192, 57, 43), // 严重：红
+        Tier::Warn => (230, 126, 34),    // 警告：橙
+        _ => (39, 174, 96),              // 正常：绿
     }
 }
 
@@ -407,8 +411,17 @@ fn icon_rect(tray: &TrayIcon) -> Option<(i32, i32, i32, i32)> {
     ))
 }
 
+/// 面板里那一小块颜色。与托盘环**故意不一致**，理由见下面两条注释：
+///
+/// 有数字：跟托盘环同一套语义，用户看环和看面板不需要重新学。
+///
+/// 只知道在充电、不知道充到哪儿：这里画蓝，托盘环那里画灰。
+/// 区别在于**这一行旁边就写着「充电中（电量未知）」**，蓝色不会单独承担含义；
+/// 而托盘环只有颜色和弧长两样东西，整环变蓝看起来就是「100%」——
+/// 那正好是 issue #10 要避免的：不拿一个编出来的档位冒充读数。
 fn swatch_of(s: &Status) -> (u8, u8, u8) {
     match s.percent {
+        None if s.charging => CHARGING_BLUE,
         None => (150, 150, 150), // 未知：灰
         Some(p) => color_of(p, s.charging),
     }
@@ -1631,7 +1644,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         is_returning, popup_lines, refresh_of, smooth, tier_of, tip_line, tooltip_of, tray_ring,
-        ReadingState, Refresh, Status, Tier, FAST_RETRY_LIMIT, SUBMIT_URL, TIP_MAX_CHARS,
+        ReadingState, Refresh, Status, Tier, CHARGING_BLUE, FAST_RETRY_LIMIT, SUBMIT_URL,
+        TIP_MAX_CHARS,
     };
     use crate::hidpp::ReadingSource;
     use crate::settings;
@@ -1794,7 +1808,16 @@ mod tests {
         let mut c = s("HyperX 天箭", "天箭", None);
         c.charging = true;
         assert_eq!(tip_line(&c, "天箭"), "天箭 充电中（电量未知）");
-        assert_eq!(popup_lines(&[c])[0].text, "HyperX 天箭  充电中（电量未知）");
+        let row = &popup_lines(std::slice::from_ref(&c))[0];
+        assert_eq!(row.text, "HyperX 天箭  充电中（电量未知）");
+        // 面板那块颜色可以画蓝：紧挨着的文字已经把「不知道多少」说清楚了
+        assert_eq!(row.swatch, CHARGING_BLUE);
+        // 托盘环不行：整环变蓝看起来就是 100%，而这里根本没有档位可画
+        assert_eq!(tray_ring(std::slice::from_ref(&c)), (None, false));
+        // 悬停文字也不该出现任何数字
+        assert!(!tooltip_of(std::slice::from_ref(&c))
+            .chars()
+            .any(|ch| ch.is_ascii_digit()));
     }
 
     #[test]

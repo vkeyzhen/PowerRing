@@ -78,9 +78,16 @@ impl RawDev {
         };
 
         let charging = is_charging(s.charging_mask, &s.charging_states, state);
-        let percent = percent_for(s, state, value)?;
+        // 数值不可用时 percent 是 None，但这次读取本身是**成功**的：
+        // 它确实答了话、也确实在充电。返回 None 会被上层当成「读不到」，
+        // 于是保留上一轮的旧读数 —— 那是个更旧的数字，比「不知道」更糟
+        let percent = if value_is_usable(s, state) {
+            Some(lookup(&s.table, state, value)?)
+        } else {
+            None
+        };
         Some(Battery {
-            percent: Some(percent),
+            percent,
             mv: 0,
             charging,
             source: ReadingSource::Live,
@@ -117,14 +124,17 @@ fn is_charging(mask: Option<u8>, states: &[u8], state: u8) -> bool {
     }
 }
 
-/// 由状态与数值算出百分比。充电且数值不可用时按满格显示 ——
-/// 这是已知的取舍（issue #10），准确做法是「不知道」，但那会让充电中的
-/// 设备从蓝环变灰环，显示语义要先定下来才敢改
-fn percent_for(s: &RawSpec, state: u8, value: u8) -> Option<u8> {
-    if s.charging_mask.is_none() && is_charging(None, &s.charging_states, state) {
-        return Some(100);
-    }
-    lookup(&s.table, state, value)
+/// 这次响应里的数值字节，还能不能当电调用。
+///
+/// 按位判充电的设备（`charging_mask`）：充电只是多置一个位，数值照旧有效。
+/// 按档位判充电的设备（`charging_states`）：那个档位下数值字节换成了另一张表的
+/// 东西，**不代表电量**。
+///
+/// 这条判据原来是写成「充电就返回 100%」的（issue #10）。那是个纯属编造的读数：
+/// 一台充到 40% 的设备会显示满格，用户据此拔线只会发现掉了一大截。
+/// 现在如实返回「不知道」，由界面说「充电中（电量未知）」。
+fn value_is_usable(s: &RawSpec, state: u8) -> bool {
+    s.charging_mask.is_some() || !s.charging_states.contains(&state)
 }
 
 /// 在分段表里查百分比：找到第一条「数值 ≤ 上界」就取它对应的百分比。
@@ -145,7 +155,7 @@ fn lookup(table: &[(u8, Vec<(u8, u8)>)], state: u8, value: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_charging, lookup, percent_for};
+    use super::{is_charging, lookup, value_is_usable};
     use crate::profile::RawSpec;
 
     /// 凌豹 MK75 实测的那份规格：17 字节请求补到 20，电量在第 6 位，
@@ -179,8 +189,9 @@ mod tests {
     #[test]
     fn 充电位不覆盖电量读数() {
         let s = mk75();
-        assert_eq!(percent_for(&s, 0x10, 89), Some(89), "充电中照读 89%");
-        assert_eq!(percent_for(&s, 0x01, 87), Some(87));
+        assert!(value_is_usable(&s, 0x10), "按位判充电时数值照读");
+        assert_eq!(lookup(&s.table, 0x10, 89), Some(89), "充电中照读 89%");
+        assert_eq!(lookup(&s.table, 0x01, 87), Some(87));
     }
 
     /// 天箭那类设备相反：充电档位下数值字节不代表电量，按满格处理
@@ -196,8 +207,16 @@ mod tests {
             charging_mask: None,
             table: vec![(0x0E, vec![(255, 60)])],
         };
-        assert_eq!(percent_for(&s, 0x10, 0x00), Some(100));
-        assert_eq!(percent_for(&s, 0x0E, 231), Some(60));
+        // 充电档位：数值不可用，如实「不知道」而不是编一个 100%
+        assert!(!value_is_usable(&s, 0x10));
+        assert!(!value_is_usable(&s, 0x11));
+        assert!(
+            is_charging(None, &s.charging_states, 0x10),
+            "充电状态本身是确定的"
+        );
+        // 非充电档位：照常查表
+        assert!(value_is_usable(&s, 0x0E));
+        assert_eq!(lookup(&s.table, 0x0E, 231), Some(60));
     }
 
     #[test]
