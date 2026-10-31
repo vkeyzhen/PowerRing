@@ -9,6 +9,8 @@
 //! 那愿景就作废了 —— 而且各家报文的差别其实就那几处（请求字节、字段下标、
 //! 换算表），正好是能声明化的东西。
 
+use std::time::{Duration, Instant};
+
 use hidapi::HidDevice;
 
 use crate::hidpp::{Battery, ReadingSource};
@@ -48,27 +50,35 @@ impl RawDev {
         if self.dev.write(&out).is_err() {
             return None;
         }
-        let r = match self.dev.read_timeout(&mut tmp, 400) {
-            Ok(k) if k > 0 => &tmp[..k],
-            _ => return None,
-        };
-        if r.len() <= s.value_index {
-            return None;
-        }
 
-        let value = r[s.value_index];
-        let state = r.get(s.state_index).copied().unwrap_or(0);
-        let charging = s.charging_states.contains(&state);
-
-        let percent = if charging {
-            // 充电中：数值字节在这个状态下不代表电量（它是另一张表的档位），
-            // 直接按满格显示。**这是已知问题**，仓库 issue #10 记着：
-            // 准确的做法是「不知道」，但它会让充电中的耳机从蓝环变成灰环，
-            // 显示语义要先定下来再改
-            100
-        } else {
-            lookup(&s.table, state, value)?
+        // 读到「长得对的那一条」为止，而不是读一条就当成答案：
+        // 有的设备一问会先回一条状态帧、再回真正带数据的帧。只读一条的话，
+        // 拿到的是状态帧里那个恒为 0 的字节，界面会一直显示 0%。
+        // 总时限仍是 400ms，多读几条不会拖慢轮询
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let (value, state) = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let ms = (left.as_millis() as i32).clamp(1, 400);
+            let r = match self.dev.read_timeout(&mut tmp, ms) {
+                Ok(k) if k > 0 => &tmp[..k],
+                _ => return None,
+            };
+            // 前缀不符就是别人的帧（状态帧、按键上报……），继续等自己那条
+            if !s.reply_prefix.is_empty() && !r.starts_with(&s.reply_prefix) {
+                continue;
+            }
+            // 太短：也没法取数，继续等
+            if r.len() <= s.value_index {
+                continue;
+            }
+            break (r[s.value_index], r.get(s.state_index).copied().unwrap_or(0));
         };
+
+        let charging = is_charging(s.charging_mask, &s.charging_states, state);
+        let percent = percent_for(s, state, value)?;
         Some(Battery {
             percent: Some(percent),
             mv: 0,
@@ -94,6 +104,29 @@ impl RawDev {
     }
 }
 
+/// 判断当前是否在充电。两种判据方向不同，必须由声明指定用哪一种：
+///
+/// - `mask`：状态字节按位判（`state & mask != 0`）。充电只是多置一个位，
+///   **电量照样有效** —— 凌豹 MK75 就是这样，充电中 89%→93% 一路涨
+/// - `states`：整个状态字节落在给定集合里。这类设备充电时数值字节整体
+///   换成了另一张表的档位，**电量不可用**（天箭）
+fn is_charging(mask: Option<u8>, states: &[u8], state: u8) -> bool {
+    match mask {
+        Some(m) => state & m != 0,
+        None => states.contains(&state),
+    }
+}
+
+/// 由状态与数值算出百分比。充电且数值不可用时按满格显示 ——
+/// 这是已知的取舍（issue #10），准确做法是「不知道」，但那会让充电中的
+/// 设备从蓝环变灰环，显示语义要先定下来才敢改
+fn percent_for(s: &RawSpec, state: u8, value: u8) -> Option<u8> {
+    if s.charging_mask.is_none() && is_charging(None, &s.charging_states, state) {
+        return Some(100);
+    }
+    lookup(&s.table, state, value)
+}
+
 /// 在分段表里查百分比：找到第一条「数值 ≤ 上界」就取它对应的百分比。
 /// 表为空时把数值当百分比直接返回（有些设备读到就是百分比，不需要换算）
 fn lookup(table: &[(u8, Vec<(u8, u8)>)], state: u8, value: u8) -> Option<u8> {
@@ -112,7 +145,60 @@ fn lookup(table: &[(u8, Vec<(u8, u8)>)], state: u8, value: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::lookup;
+    use super::{is_charging, lookup, percent_for};
+    use crate::profile::RawSpec;
+
+    /// 凌豹 MK75 实测的那份规格：17 字节请求补到 20，电量在第 6 位，
+    /// 第 7 位是状态（0x01 电池 / 0x10 充电），数值本身就是百分比
+    fn mk75() -> RawSpec {
+        RawSpec {
+            request: vec![0x13, 0x05],
+            reply_len: 20,
+            reply_prefix: vec![0x13, 0x0A, 0x01, 0x00, 0x04, 0x05],
+            state_index: 7,
+            value_index: 6,
+            charging_states: Vec::new(),
+            charging_mask: Some(0x10),
+            table: Vec::new(),
+        }
+    }
+
+    /// 按位判充电：拔线是 0x01、插线是 0x10，两种都要认对。
+    /// 若写成「整字节相等」，充电时若再有别的位被置上（0x11），就会判成没充电
+    #[test]
+    fn 充电位按位判断() {
+        let m = Some(0x10);
+        assert!(!is_charging(m, &[], 0x01), "拔线状态不该算充电");
+        assert!(is_charging(m, &[], 0x10), "插线状态要算充电");
+        assert!(is_charging(m, &[], 0x11), "别的位一起置上也要算充电");
+        assert!(!is_charging(m, &[], 0x00));
+    }
+
+    /// 用充电位的那类设备，充电中电量照样是真实读数。
+    /// 以前一律按满格 100% 处理，会把 89% 显示成 100%
+    #[test]
+    fn 充电位不覆盖电量读数() {
+        let s = mk75();
+        assert_eq!(percent_for(&s, 0x10, 89), Some(89), "充电中照读 89%");
+        assert_eq!(percent_for(&s, 0x01, 87), Some(87));
+    }
+
+    /// 天箭那类设备相反：充电档位下数值字节不代表电量，按满格处理
+    #[test]
+    fn 充电档位下数值作废() {
+        let s = RawSpec {
+            request: vec![0x21, 0xFF, 0x05],
+            reply_len: 20,
+            reply_prefix: Vec::new(),
+            state_index: 3,
+            value_index: 4,
+            charging_states: vec![0x10, 0x11],
+            charging_mask: None,
+            table: vec![(0x0E, vec![(255, 60)])],
+        };
+        assert_eq!(percent_for(&s, 0x10, 0x00), Some(100));
+        assert_eq!(percent_for(&s, 0x0E, 231), Some(60));
+    }
 
     #[test]
     fn 查表落在区间内() {

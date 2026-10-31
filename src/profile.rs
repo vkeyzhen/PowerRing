@@ -129,6 +129,17 @@ struct RawBattery {
     value_index: Option<usize>,
     #[serde(default)]
     charging_states: Option<Vec<String>>,
+    /// 只接受以这几个字节开头的响应帧，其余当无关帧继续读。
+    /// 有些设备一问会先回一条状态帧、再回真正带数据的帧，没有这个字段
+    /// 就会把状态帧当成答案，读到一串恒为 0 的字节
+    #[serde(default)]
+    reply_prefix: Option<String>,
+    /// 充电判断的位掩码：状态字节 `& ` 它非零即正在充电。
+    /// 与 charging_states 的区别是**数值仍然有效** —— 有的设备充电时
+    /// 电量照报，只是多置一个位；有的设备充电时数值整体换义（那就用
+    /// charging_states）。两者语义相反，不能混用
+    #[serde(default)]
+    charging_mask: Option<String>,
     /// 档位 → 分段表。key 是档位字节（如 "0x0E"），value 是 [[上界, 百分比], ...]
     #[serde(default)]
     table: Option<std::collections::HashMap<String, Vec<(u8, u8)>>>,
@@ -171,6 +182,33 @@ impl RawBattery {
                 "字节下标越界：value_index={value_index}、state_index={state_index}，但 reply_len 只有 {reply_len}"
             ));
         }
+        let reply_prefix = match self.reply_prefix.as_deref() {
+            Some(t) => hex_bytes(t).ok_or(format!("reply_prefix 写成了 \"{t}\"，读不出字节"))?,
+            None => Vec::new(),
+        };
+        if reply_prefix.len() > reply_len {
+            return Err(format!(
+                "reply_prefix 有 {} 字节，比 reply_len（{reply_len}）还长",
+                reply_prefix.len()
+            ));
+        }
+        let charging_mask = match self.charging_mask.as_deref() {
+            Some(t) => Some(hex_byte(t).ok_or(format!("charging_mask 的 {t} 不是合法十六进制"))?),
+            None => None,
+        };
+        // 两种充电判据方向相反：一个说「充电时数值作废」，一个说「充电时数值照读」。
+        // 同时写出来只能说明声明作者没想清楚要哪一种，静默取其一比报错更糟
+        let has_states = self
+            .charging_states
+            .as_deref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if charging_mask.is_some() && has_states {
+            return Err(
+                "charging_states 与 charging_mask 只能选一个：前者表示充电时数值作废，后者表示仍有效"
+                    .to_string(),
+            );
+        }
         Ok(RawSpec {
             reply_len,
             request,
@@ -183,6 +221,8 @@ impl RawBattery {
                 .iter()
                 .map(|s| hex_byte(s).ok_or(format!("charging_states 里的 {s} 不是合法十六进制")))
                 .collect::<Result<Vec<u8>, String>>()?,
+            reply_prefix,
+            charging_mask,
             table,
         })
     }
@@ -208,8 +248,12 @@ pub struct RawSpec {
     pub state_index: usize,
     /// 响应里「数值」字节的下标
     pub value_index: usize,
-    /// 档位字节取这些值时表示正在充电
+    /// 档位字节取这些值时表示正在充电，且此时数值字节**不代表电量**
     pub charging_states: Vec<u8>,
+    /// 只接受以这几个字节开头的响应帧。空表示不挑帧
+    pub reply_prefix: Vec<u8>,
+    /// 充电判断的位掩码。置位表示正在充电，但数值仍然有效
+    pub charging_mask: Option<u8>,
     /// 分段映射表：每个档位一串 (数值上界, 百分比)，
     /// 数值落在第一个「不超过上界」的区间里就取那个百分比。
     /// 用分段而不是公式 —— 实测这些设备的数值与百分比不是线性关系
@@ -740,15 +784,30 @@ fn to_yaml(p: &Profile, note: &str) -> String {
     if let Some(raw) = &p.raw {
         s.push_str(&format!("  request: \"{}\"\n", hex_str(&raw.request)));
         s.push_str(&format!("  reply_len: {}\n", raw.reply_len));
+        // 不挑帧的声明不写这一行：自动发现生成的 raw 声明会把整份文件写到
+        // 用户目录里，多一行空值就多一处让人以为是必填项的地方
+        if !raw.reply_prefix.is_empty() {
+            s.push_str(&format!(
+                "  reply_prefix: \"{}\"\n",
+                hex_str(&raw.reply_prefix)
+            ));
+        }
         s.push_str(&format!("  state_index: {}\n", raw.state_index));
         s.push_str(&format!("  value_index: {}\n", raw.value_index));
-        let charging = raw
-            .charging_states
-            .iter()
-            .map(|b| format!("\"0x{b:02X}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        s.push_str(&format!("  charging_states: [{charging}]\n"));
+        // 两种充电判据互斥（见 compile_spec 的校验），写出去也只能写一个。
+        // 以前这里无条件写 charging_states，于是 charging_mask 的声明
+        // 往返一圈就变成「充电时数值作废」，充电中电量会被硬按成 100%
+        if let Some(m) = raw.charging_mask {
+            s.push_str(&format!("  charging_mask: \"0x{m:02X}\"\n"));
+        } else {
+            let charging = raw
+                .charging_states
+                .iter()
+                .map(|b| format!("\"0x{b:02X}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            s.push_str(&format!("  charging_states: [{charging}]\n"));
+        }
         if !raw.table.is_empty() {
             s.push_str("  table:\n");
             // 编译时已按档位排过序，写出去也保持这个顺序：
@@ -1322,6 +1381,8 @@ mod tests {
             state_index: None,
             value_index: Some(4),
             charging_states: None,
+            reply_prefix: None,
+            charging_mask: None,
             table: None,
         };
         assert!(big.compile_spec().is_err());
@@ -1336,6 +1397,8 @@ mod tests {
             state_index: None,
             value_index: Some(30),
             charging_states: None,
+            reply_prefix: None,
+            charging_mask: None,
             table: None,
         };
         assert!(oob.compile_spec().is_err());
@@ -1349,6 +1412,8 @@ mod tests {
             state_index: Some(3),
             value_index: Some(4),
             charging_states: None,
+            reply_prefix: None,
+            charging_mask: None,
             table: None,
         };
         let spec = ok.compile_spec().expect("20 字节、下标 3/4 是合法的");
